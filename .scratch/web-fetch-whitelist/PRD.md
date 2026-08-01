@@ -108,9 +108,11 @@ in-process. Fetches in tests hit local test servers, never the real network.
   questions. Only after the core loop is proven.
 - Containerization and the Ansible role wiring back into the `homeserver` repo.
 - Response size limits and content-type filtering.
-- Redirect handling. A fetch that follows a redirect to a non-whitelisted host
-  currently bypasses the gate. This is a real gap, deliberately deferred so the
-  first slice proves the approval loop. Revisit immediately after.
+
+Redirect handling was originally deferred here. A fetch that follows a redirect
+to a non-whitelisted host bypasses the gate, which is a real gap rather than an
+acceptable omission, so it is now filed as ticket 04 rather than left unscoped.
+It is sequenced after the approval loop exists, not dropped.
 
 ## Known unknowns
 
