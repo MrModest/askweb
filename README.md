@@ -10,11 +10,13 @@ named, and puts everything else in front of you before it is fetched.
 
 ## Status
 
-All four tickets are implemented: whitelisted fetch over Streamable HTTP, a
-human approval prompt for unknown hosts, persistence of hosts approved with
-**always**, and re-validation of every redirect hop.
+The server is complete: whitelisted fetch over Streamable HTTP, a human
+approval prompt for unknown hosts, persistence of hosts approved with
+**always**, and re-validation of every redirect hop. It ships as a container
+image built and smoke-tested on every merge.
 
-See `.scratch/web-fetch-whitelist/` for the PRD.
+See `.scratch/web-fetch-whitelist/` and `.scratch/containerization/` for the
+PRDs.
 
 ## Install and run
 
@@ -26,6 +28,98 @@ go build ./cmd/askweb
 ```
 
 The server listens on `:8080` and serves MCP over Streamable HTTP at `/mcp`.
+
+## Running in Docker
+
+An image is published for every merge to `main`, for `linux/amd64` and
+`linux/arm64` under one tag — pull it and your client picks the right one.
+
+```sh
+docker pull ghcr.io/mrmodest/askweb:edge
+```
+
+| Tag | Moves? | Use it for |
+|---|---|---|
+| `edge` | yes, every merge to `main` | trying it out, or a stack you redeploy deliberately |
+| `sha-<short>` | never | pinning a deployment to an exact commit |
+| `1.2.3`, `1.2` | on releases | pinning to a release once one is tagged |
+
+Pin `sha-` or a semver tag for anything you care about. `edge` moving under you
+is the point of `edge`.
+
+The compose file in this repository runs it:
+
+```sh
+mkdir -p ./data && sudo chown 10001:10001 ./data
+docker compose up -d
+```
+
+That publishes `8080` and mounts `./data`. Override any of it from the
+environment without touching the image: `ASKWEB_HOST_PORT`,
+`ASKWEB_CONTAINER_PORT`, `ASKWEB_ADDR`, `ASKWEB_WHITELIST`, `ASKWEB_DATA_DIR`.
+
+**The container speaks plain HTTP and holds no certificate.** Reach it by
+service name on a private compose network, or put a reverse proxy that
+terminates TLS in front of it. It does verify the certificates of the hosts it
+fetches — that is a separate concern, and the image carries the root store for
+it.
+
+### The data directory
+
+The whitelist lives at `/app/data/whitelist.json`, and it is the **directory**
+that is mounted, never the file. Approvals are saved by writing a temporary file
+alongside the target and renaming it into place, so the directory has to be
+writable — and on a first run there has to be somewhere to create the file at
+all. Bind-mounting `whitelist.json` itself gives you a server that cannot save a
+single approval.
+
+### Running as your own user
+
+The image runs as uid:gid `10001:10001` and never as root. Any other user works:
+
+```yaml
+    user: "1003:1002"
+```
+
+Nothing in the image depends on that user existing in `/etc/passwd`, on `$HOME`,
+or on a uid fixed at build time.
+
+**Matching the mounted directory's ownership is your job.** The image does not
+`chown` anything at startup — that would need root, in a container whose whole
+point is not having it. Give the directory to whichever user you chose:
+
+```sh
+mkdir -p ./data && sudo chown 1003:1002 ./data
+```
+
+Get it wrong and the server tells you at startup rather than discovering it
+weeks later as "approvals keep disappearing":
+
+```
+2026/08/21 23:01:51 askweb: creating whitelist /app/data/whitelist.json: open /app/data/whitelist.json.2539359718.tmp: permission denied
+```
+
+An existing whitelist it cannot replace fails the same way, naming the path. If
+Docker creates the bind-mount directory for you it will belong to root, and this
+is the error you will get.
+
+### Editing the whitelist by hand
+
+The same rule as the binary, and it bites more easily here: the file is
+rewritten from what was loaded at startup plus everything approved since, so
+edits made while the stack is running are lost at the next *always*. Stop it
+first:
+
+```sh
+docker compose stop askweb
+sudo $EDITOR ./data/whitelist.json
+docker compose start askweb
+```
+
+The file belongs to whichever user the container runs as, not to you, which is
+why that needs `sudo` — and why the server can write it and you cannot.
+
+Restarting drops MCP sessions, so connected clients reconnect afterwards.
 
 ## Configuration
 
@@ -64,8 +158,15 @@ at all, silently.
 **Subdomains are not implied.** An entry for `example.com` grants `example.com`
 and nothing else. `www.example.com` needs its own line.
 
-A missing file is treated as an empty whitelist rather than an error, so a first
-run needs no setup. That still refuses everything.
+A missing file is not an error. At startup the server creates it holding an
+empty list, so a first run needs no setup and you get immediate confirmation
+that the path — or the mount — is the one you meant. An empty whitelist still
+refuses everything.
+
+What it will not do is start against a whitelist it cannot write. A directory it
+cannot create the file in, or an existing file it cannot replace, is a startup
+error naming the path, because the alternative is a server that accepts
+approvals and quietly forgets them.
 
 Approving a host with **always** appends it here, sorted and canonical. The file
 is rewritten atomically — written alongside, flushed, and renamed into place — so
@@ -211,12 +312,28 @@ Recorded as ADRs in [`docs/adr/`](docs/adr/):
   carried as a multi-round-trip input request, superseding ADR-0001's mechanism
 - [ADR-0006](docs/adr/0006-per-hop-redirect-gating.md) — every redirect hop is
   checked against the whitelist
+- [ADR-0007](docs/adr/0007-create-the-whitelist-at-startup.md) — the whitelist is
+  created at startup, and a server that cannot write it refuses to start
 
 ## Development
 
 ```sh
 go test ./...
 ```
+
+The Go suite needs no Docker and never touches the network. The container is
+covered separately by a smoke test that runs against a built image — the same
+one CI runs before anything is published:
+
+```sh
+docker build -t askweb:smoke . && scripts/smoke-test.sh askweb:smoke
+```
+
+It asserts what an operator can see from outside: that the server answers on the
+published port, fetches a whitelisted `https` host, keeps an *always* approval
+across a container restart, and does all of it again under an overridden uid and
+gid. It reaches `example.com`, since proving the certificate store is present is
+the point of one of those assertions.
 
 Layout:
 
