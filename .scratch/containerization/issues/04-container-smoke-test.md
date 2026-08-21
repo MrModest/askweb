@@ -37,11 +37,60 @@ with none installed.
 
 **Status:** ready-for-agent
 
-- [ ] The job builds the image from the commit under test and runs it
-- [ ] It fails if the server does not answer MCP on the published port
-- [ ] It fails if fetching a whitelisted `https` host fails
-- [ ] It fails if an *always* approval does not survive a container restart
-- [ ] It repeats the above under an overridden uid and gid, and fails if they break
-- [ ] It is gated on the test job and does not run when tests fail
-- [ ] It asserts nothing about how the image is built or layered
-- [ ] `go test ./...` still passes on a machine with no Docker installed
+- [x] The job builds the image from the commit under test and runs it
+- [x] It fails if the server does not answer MCP on the published port
+- [x] It fails if fetching a whitelisted `https` host fails
+- [x] It fails if an *always* approval does not survive a container restart
+- [x] It repeats the above under an overridden uid and gid, and fails if they break
+- [x] It is gated on the test job and does not run when tests fail
+- [x] It asserts nothing about how the image is built or layered
+- [x] `go test ./...` still passes on a machine with no Docker installed
+
+## Comments
+
+Implemented as `scripts/smoke-test.sh`, run by a `smoke` job in the ticket 01
+workflow with `needs: test`. The script takes an image tag, so it runs
+identically in CI and by hand. Every assertion goes through the published port,
+MCP at `/mcp`, and the mounted directory; nothing touches the base image, the
+layers, the size, or a path inside the container. No Go file mentions Docker,
+so the Go suite still passes on a machine without it.
+
+**The client speaks protocol 2025-06-18, deliberately.** A client asking for
+2026-07-28 is refused outright — the SDK serves that version only on a stateless
+handler, and this server is stateful. On 2025-06-18 the SDK bridges an input
+request to a server-initiated `elicitation/create` over the event stream, so the
+script performs the exchange a real client performs: it streams the tool call,
+reads the question off the stream, answers it as a JSON-RPC response, and reads
+the completed call off the same stream. Discovered by trying the other way
+first, which hung and then failed with `protocol version "2026-07-28" is only
+supported on stateless HTTP servers`.
+
+Both passes end with a control: an unapproved host is still refused, so a pass
+cannot come from a server that allows everything.
+
+**Mutation-tested — what it catches and what it does not.** Two mutants are
+caught:
+
+- `/app` usable by the image's default user only (`chown -R askweb && chmod -R
+  750`): the default-user pass stays fully green and only the overridden-uid
+  pass fails. This is the regression the ticket is about, and it is caught
+  precisely.
+- `/app` not traversable at all: fails in the first pass.
+
+Two mutants are **not** caught, both worth knowing:
+
+- **Removing `apk add --no-cache ca-certificates` changes nothing**, because
+  `alpine:3.23` already ships `/etc/ssl/certs/ca-certificates.crt` via
+  `ca-certificates-bundle` in the base image. The explicit install is kept — it
+  states the dependency, and a base image is free to drop a bundle it never
+  promised — but the certificate assertion cannot detect its removal on this
+  base. It would still catch a move to `scratch` or a distroless base without
+  roots, which is the failure the assertion was written for.
+- **A binary that is not world-executable still starts.** `runc` execs the
+  entrypoint while it still holds `CAP_DAC_OVERRIDE`, so `chmod 750` on the
+  binary does not stop the container; the process then runs with `CapEff: 0` and
+  is enforced normally for everything it does afterwards. Confirmed by isolating
+  read from exec inside the container: a shell there gets `exit 126` on the same
+  binary Docker started happily. So the world-executable bit is real but is not
+  what the uid pass proves — the pass proves the directories are traversable and
+  the data directory is writable, which is what actually breaks.
