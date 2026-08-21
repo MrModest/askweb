@@ -149,3 +149,28 @@ Observed against the ticket-02 build, so these need no further research.
   from this client. The server still denies that case; a button UI may not
   enforce it the same way.
 - **Declining denies and fetches nothing**, as designed.
+
+### Resolved empirically — 2026-08-22, Claude Code CLI
+
+Observed against the ticket-04 build. The redirect gate itself behaves as
+specified against a real client and real redirects: a whitelisted host that
+redirects to an unapproved one is caught and refused naming only the redirect
+target, and a redirect to a whitelisted host is followed with no second prompt.
+
+- **This client does not surface a round carrying more than one input request.**
+  A chain with two unknown hops makes the server return two questions in one
+  round — the repeat that keeps the earlier approval alive
+  ([ADR-0006](../../docs/adr/0006-per-hop-redirect-gating.md)). Claude Code
+  returns an empty result instead of prompting: no content, no error, no
+  questions shown. Verified with curl that the server's response is well-formed
+  and that answering both questions completes the chain correctly, so this is a
+  client limitation rather than a server defect. The Go SDK's client middleware
+  fulfils every entry of the map in parallel; this client is a separate
+  implementation.
+- **Consequence: prefer `always` for chains that cross more than one unknown
+  host.** An `always` is on disk by the retry, so the earlier hop is whitelisted
+  rather than repeated and every round carries exactly one question. `once`
+  works for any chain with a single unknown hop, wherever it falls.
+- **Worth re-testing on Hermes.** If its client shares this limitation, the
+  Telegram button UI needs a way to express several pending questions at once,
+  or multi-hop chains are `always`-only there too.

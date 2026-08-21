@@ -62,6 +62,13 @@ parallel, asking again costs a round trip, not a round trip per host.
   is repeated. With `once` a human is asked about the earlier hops again — for
   two unknown hops, three prompts over three round trips. Chains long enough to
   exceed the SDK's ten-retry cap fail closed.
+- Not every client renders a round carrying several questions. The response is
+  well-formed under SEP-2322 and the Go SDK's client middleware fulfils each
+  entry in parallel, but Claude Code returns an empty result rather than
+  prompting, which leaves a chain of two unknown hops unusable there with
+  `once`. `always` keeps every round to a single question and is the guidance
+  for such chains. Verified against a live client on 2026-08-22; see the PRD's
+  findings section.
 - An `always` whose save fails is deliberately treated as exactly as durable as
   a `once`: allowed for this call, repeated in any later prompt. Anything else
   would let a chain stall on an approval that was never written down.

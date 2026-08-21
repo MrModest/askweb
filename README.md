@@ -142,12 +142,21 @@ Chains are bounded at ten hops, so a site that redirects to itself fails instead
 of spinning.
 
 If a chain needs you to approve more than one host, you are asked about the
-earlier ones again alongside the new one — two unknown hops means three prompts.
-That repetition is deliberate: your client sends back only the answers to the
-questions it was last asked, so a host left out of a later prompt would have its
-approval dropped and the chain would stall
-([ADR-0006](docs/adr/0006-per-hop-redirect-gating.md)). Answering **always**
-avoids the repeat, since the host is on the whitelist by the next round.
+earlier ones again alongside the new one — two unknown hops means three prompts
+over three rounds. That repetition is deliberate: your client sends back only
+the answers to the questions it was last asked, so a host left out of a later
+prompt would have its approval dropped and the chain would stall
+([ADR-0006](docs/adr/0006-per-hop-redirect-gating.md)).
+
+**Prefer `always` for chains crossing more than one unknown host.** An `always`
+is saved before the call is retried, so the earlier host is whitelisted rather
+than asked about again, and every round carries a single question.
+
+That is not only tidier — some clients need it. A round carrying two questions
+at once is well-formed under SEP-2322, but not every client renders one; Claude
+Code returns an empty result rather than prompting, which makes a two-unknown-hop
+chain unusable with `once` there. Answering `always` keeps each round to one
+question and works everywhere.
 
 ## How matching works
 
