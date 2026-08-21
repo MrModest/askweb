@@ -33,7 +33,7 @@ func run(args []string) error {
 		return err
 	}
 
-	store, err := whitelist.Load(cfg.WhitelistPath)
+	store, err := whitelist.Open(cfg.WhitelistPath)
 	if err != nil {
 		return err
 	}

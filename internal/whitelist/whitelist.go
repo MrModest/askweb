@@ -26,10 +26,59 @@ type Store struct {
 	hosts map[string]struct{}
 }
 
+// Open loads the whitelist at path the way a starting server needs it, and is
+// what a server should call rather than Load.
+//
+// A missing file is created holding an empty list. That is the normal first
+// run, not a problem: an operator who mounts an empty data directory gets a
+// whitelist file, and with it immediate confirmation that the mount is right.
+// An empty list approves nothing, so the server still refuses every host until
+// a human approves one.
+//
+// A path the whitelist cannot be written to is a startup error naming it. The
+// whitelist is runtime state, and an approval that cannot be saved is logged
+// and dropped — correct for the call in flight, but invisible to whoever
+// deployed the server. Found at startup, the same misconfiguration is a
+// deploy-time error against the path instead of an approval that quietly never
+// persists.
+//
+// An existing whitelist is read and nothing more: never rewritten, reordered,
+// or reformatted, since its contents and its formatting are the operator's.
+func Open(path string) (*Store, error) {
+	if _, err := os.Stat(path); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		if err := save(path, []string{}); err != nil {
+			return nil, fmt.Errorf("creating whitelist %s: %w", path, err)
+		}
+	} else if err := writable(path); err != nil {
+		return nil, fmt.Errorf("whitelist %s cannot be written: %w", path, err)
+	}
+	return Load(path)
+}
+
+// writable reports whether save would be able to replace path, by doing the one
+// thing save needs and no more: creating a file beside it, which is where the
+// atomic rename comes from. The whitelist itself is never opened for writing.
+func writable(path string) error {
+	temp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	temp.Close()
+	return os.Remove(temp.Name())
+}
+
 // Load reads a JSON array of canonical hostnames from path.
 //
-// A missing file is an empty whitelist, so a first run needs no setup. Every
-// entry must already be canonical: since Allowed does not normalize, a
+// A missing file is an empty whitelist, and so is a path that cannot be written
+// at all: Load never writes, so it stays usable when the file underneath it is
+// not. A running server depends on that — an approval it cannot save still
+// allows the call the human approved (see Add). Open is the startup path that
+// refuses such a file up front.
+//
+// Every entry must already be canonical: since Allowed does not normalize, a
 // non-canonical entry would be a line in the file that grants nothing, so it is
 // a startup error rather than a silent no-op.
 func Load(path string) (*Store, error) {
