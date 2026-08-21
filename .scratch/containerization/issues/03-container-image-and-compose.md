@@ -41,15 +41,61 @@ banner-commented stages, explicit `COPY` of the paths needed rather than
 
 **Status:** ready-for-agent
 
-- [ ] `docker build` produces an image that starts and serves MCP at `/mcp`
-- [ ] Fetching a whitelisted `https` host from inside the container succeeds
-- [ ] The container runs as a non-root user by default
-- [ ] `user: "1003:1002"` starts and serves, given a data directory writable by it
-- [ ] `docker compose up -d` starts the server with the port published
-- [ ] The whitelist path defaults to `/app/data/whitelist.json` via the environment
-- [ ] Compose mounts the `/app/data` directory, not the whitelist file
-- [ ] An *always* approval survives `docker compose restart` and `down` then `up`
-- [ ] The host port and listen address are configurable without editing the image
-- [ ] The image carries OCI labels tracing back to the source repository
-- [ ] A `.dockerignore` keeps the build context free of the binary, git, and scratch files
-- [ ] The compose file documents that mount ownership must match the chosen user
+- [x] `docker build` produces an image that starts and serves MCP at `/mcp`
+- [x] Fetching a whitelisted `https` host from inside the container succeeds
+- [x] The container runs as a non-root user by default
+- [x] `user: "1003:1002"` starts and serves, given a data directory writable by it
+- [x] `docker compose up -d` starts the server with the port published
+- [x] The whitelist path defaults to `/app/data/whitelist.json` via the environment
+- [x] Compose mounts the `/app/data` directory, not the whitelist file
+- [x] An *always* approval survives `docker compose restart` and `down` then `up`
+- [x] The host port and listen address are configurable without editing the image
+- [x] The image carries OCI labels tracing back to the source repository
+- [x] A `.dockerignore` keeps the build context free of the binary, git, and scratch files
+- [x] The compose file documents that mount ownership must match the chosen user
+
+## Comments
+
+Implemented as `Dockerfile`, `docker-compose.yml`, and `.dockerignore`. All
+twelve criteria were verified against a running daemon, not reasoned about.
+
+Builder is `golang:1.26.5-alpine3.23` with `CGO_ENABLED=0` and
+`ARG TARGETOS/TARGETARCH`, so ticket 05 can cross-build both architectures from
+one builder with no emulator. Runtime is `alpine:3.23` with
+`apk add --no-cache ca-certificates` — installed, never copied out of the
+builder, where it would silently stop matching if the builder image changed.
+Image is 26 MB.
+
+Arbitrary-uid support follows the reference Dockerfile: as a temporary root
+`USER`, `a+r` every file and `a+rx` every directory under `/app` plus the
+binary, then drop back to `USER askweb` (10001:10001, `-S -H -D`, no home). An
+overridden uid owns nothing in the image and is in no group there, so it gets
+only the *other* bits — which is why they have to be set at build time.
+
+`/app/data` is created owned by the default user and nothing further: no
+entrypoint `chown`, no gid-0 trick, no startup fixup. Making it writable by an
+unknown future uid has no build-time answer short of `0777`, which is not a
+reasonable mode for the directory holding the security boundary.
+
+Independently re-verified after the fact: default user is `uid=10001`; a real
+`web_fetch` of an `https` host returned the page body with no `x509` error; a
+non-whitelisted host on a client that cannot prompt was refused; `--user
+1003:1002` against an empty mount started and created `whitelist.json` as `[]`
+at mode `0600`; and an unwritable mount refused to start, naming the path. The
+last two are ticket 02 and this ticket meeting: the ownership mistake this
+image deliberately does not paper over now fails at deploy time instead of
+silently dropping approvals.
+
+`/data` added to `.gitignore` so a default `docker compose up` does not leave
+the operator's whitelist state showing as untracked.
+
+Two notes carried forward:
+
+- On macOS, Docker Desktop bind mounts go through virtiofs and are more
+  permissive about host ownership than a Linux host, so the *negative*
+  ownership case is only partly reproducible here. It was reproduced by
+  mounting a `0555` directory instead.
+- A bare `docker compose up -d` with no `ASKWEB_DATA_DIR` lets Docker create
+  `./data` owned by root, which uid 10001 cannot write. The compose file calls
+  this out with the `chown` fix; the server now refuses to start rather than
+  forgetting approvals.

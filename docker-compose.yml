@@ -1,0 +1,66 @@
+# askweb — whitelisted web-access MCP server.
+#
+# Reachable at http://<host>:${ASKWEB_HOST_PORT:-8080}/mcp. Plain HTTP by
+# design: put a TLS-terminating reverse proxy in front, or reach it by service
+# name over this compose network. The image holds no server certificate.
+
+services:
+  askweb:
+    image: ghcr.io/mrmodest/askweb:edge
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: askweb
+    restart: unless-stopped
+
+    environment:
+      # Listen address inside the container. Nothing binds below port 1024,
+      # since a non-root user cannot. Keep the port here in sync with
+      # ASKWEB_CONTAINER_PORT below.
+      ASKWEB_ADDR: "${ASKWEB_ADDR:-:8080}"
+      # The whitelist file, inside the mounted data DIRECTORY (see volumes).
+      ASKWEB_WHITELIST: "${ASKWEB_WHITELIST:-/app/data/whitelist.json}"
+
+    ports:
+      # host:container. Both sides are configurable from the environment, so
+      # neither needs a rebuild:
+      #   ASKWEB_HOST_PORT=9090 docker compose up -d
+      - "${ASKWEB_HOST_PORT:-8080}:${ASKWEB_CONTAINER_PORT:-8080}"
+
+    volumes:
+      # Mount the DIRECTORY, never whitelist.json itself. An approval chosen
+      # with "always" is saved by writing a temp file alongside the target and
+      # renaming it into place, so the *directory* must be writable — and a
+      # first run needs somewhere to create the file.
+      - "${ASKWEB_DATA_DIR:-./data}:/app/data"
+
+    # ---------------------------------------------------------------------
+    # MOUNT OWNERSHIP IS THE OPERATOR'S JOB.
+    #
+    # The image runs as its own non-root user, uid:gid 10001:10001, and creates
+    # /app/data owned by it. It does nothing further: no chown at startup, no
+    # gid-0 group trick, no permission fixups. So before the first `up`, create
+    # the data directory yourself and give it to the user the container runs as:
+    #
+    #   mkdir -p ./data && sudo chown 10001:10001 ./data
+    #
+    # To run as a user your host already has, uncomment `user:` below and chown
+    # the directory to THAT uid:gid instead. Any uid:gid works — nothing in the
+    # image depends on the user existing in /etc/passwd, on $HOME, or on a uid
+    # known at build time.
+    #
+    #   mkdir -p ./data && sudo chown 1003:1002 ./data
+    #
+    # Get this wrong and the failure is silent: the server starts, fetches, and
+    # accepts "always" — then forgets the approval, because it cannot write the
+    # whitelist.
+    #
+    # If Docker creates the bind-mount directory for you it will be owned by
+    # root and none of the above holds.
+    # ---------------------------------------------------------------------
+    #user: "1003:1002"
+
+# The whitelist is runtime state: the server rewrites the file from what it
+# loaded at startup plus everything approved with "always" since. Hand edits
+# made while the container runs are overwritten by the next approval, so stop
+# the stack before editing whitelist.json yourself.

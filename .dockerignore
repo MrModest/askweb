@@ -1,0 +1,38 @@
+# The build context only needs what the Dockerfile COPYs: go.mod, go.sum,
+# cmd/, and internal/. Everything else is excluded so a stale local binary or
+# a whitelist full of approvals can never end up in an image layer.
+
+# Compiled binary at the repo root
+/askweb
+
+# Runtime state: the whitelist belongs on the operator's volume, not in the image
+/whitelist.json
+
+# VCS, editor, and agent scratch space
+.git
+.gitignore
+.github
+.claude
+.scratch
+
+# Prose
+docs
+README.md
+AGENTS.md
+CLAUDE.md
+
+# Docker and CI files themselves
+Dockerfile
+.dockerignore
+docker-compose.yml
+docker-compose.*.yml
+compose.yaml
+compose.yml
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Local build and coverage output
+**/*.test
+**/*.out
