@@ -129,27 +129,43 @@ implementation and rot.
 ## Implementation Decisions
 
 **Image.** Multi-stage build. A Go build stage compiles a static binary with
-CGO disabled; the final stage carries the binary, CA certificates, and nothing
-else. The final stage should be `scratch` or a distroless static base — the
-decision hinges only on whether a shell is wanted for debugging, and the default
-is no shell. **CA certificates must be copied in explicitly**; without them
-every `https` fetch fails certificate verification, which is the product's only
-job. This is the single easiest way to ship a broken image, and the smoke test
-exists largely to catch it.
+CGO disabled; the final stage carries the binary, a CA bundle, and nothing else.
+The final stage should be `scratch` or a distroless static base — the decision
+hinges only on whether a shell is wanted for debugging, and the default is no
+shell.
 
-**Non-root.** The image runs as a fixed non-root uid/gid. Because the whitelist
-is written at runtime, that uid must own — or be able to write — the mounted
-whitelist path. The interaction between a fixed image uid and host bind-mount
-ownership is the sharpest edge in this work and should be decided explicitly:
-either a named volume initialised at first run, or a documented `user:` override
-in compose. A bind-mount of a host file owned by another uid will produce a
-server that runs fine and silently forgets every approval.
+**A CA bundle must be copied in explicitly.** This is about *outbound* TLS, not
+inbound: `askweb` verifies the certificates of the whitelisted hosts it fetches,
+and Go reads the root store from disk — `/etc/ssl/certs/ca-certificates.crt` and
+a handful of distro alternatives. A `scratch` image has none of them, so every
+fetch fails with `x509: certificate signed by unknown authority` while the
+server itself looks perfectly healthy. Verified locally: the same binary against
+the same URL returns `200 OK` with the system pool and that error with an empty
+one. One `COPY` from the build stage fixes it; the smoke test exists largely to
+catch its absence.
 
-**Whitelist location.** The container's default whitelist path should be an
-absolute path under a dedicated data directory rather than the working
-directory's relative `whitelist.json`, so that the mount point is unambiguous.
-Set through `ASKWEB_WHITELIST`, not a baked-in flag, so an operator can still
-override it.
+**No inbound TLS.** The server speaks plain HTTP on `/mcp` and is reached either
+over a private compose network or through a reverse proxy that terminates TLS.
+The image holds no server certificate and no TLS configuration.
+
+**Non-root.** The image runs as a fixed non-root uid/gid, and that uid must be
+able to write the mounted data directory. A named volume is initialised by
+Docker with the image's ownership and just works; a bind-mount of a host
+directory owned by another uid does not, and produces a server that runs fine
+and silently forgets every approval. Compose should default to the case that
+works and document the `user:` override for operators who want a bind-mount.
+
+**Whitelist location.** The image defaults `ASKWEB_WHITELIST` to an absolute
+path under a dedicated data directory — `/app/data/whitelist.json` — rather than
+the working directory's relative `whitelist.json`, so the mount point is
+unambiguous. Set through the environment variable, not a baked-in flag, so an
+operator can still override it.
+
+Compose mounts the **directory**, `/app/data`, not the file. That matters: the
+server writes the whitelist by creating a temp file alongside it and renaming
+into place, so it needs write permission on the containing directory, not just
+on the file. Mounting a single file also means a first run with no whitelist has
+nowhere to create one.
 
 **Fail loudly on an unwritable whitelist.** Today an unsaveable approval is
 logged and dropped, which is correct at runtime but invisible at deploy time.
@@ -176,10 +192,11 @@ on version tags.
 publish `-amd64` / `-arm64` suffixed tags, because Node builds under emulation
 are painfully slow. That constraint does not apply here: Go cross-compiles, so a
 single job can produce both platforms by varying `GOARCH` with no emulation.
-The decision is therefore **one multi-arch build job publishing a single
-manifest list**, so that operators pull one tag and get the right architecture.
-Suffixed per-arch tags are not published. If a future dependency introduces cgo,
-this decision needs revisiting.
+The decision, confirmed with the maintainer, is **one multi-arch build job
+publishing a single manifest list**, so operators pull one tag and get the right
+architecture. No emulation, no per-arch suffixed tags, one workflow. If a future
+dependency introduces cgo this needs revisiting, since cross-compiling would
+then need a C toolchain per target.
 
 **Workflow layout.** Two workflows, matching the reference repo's separation of
 concerns: a `ci` workflow running formatting, vet, and tests on pushes and pull
