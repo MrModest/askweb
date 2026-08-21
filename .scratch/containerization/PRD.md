@@ -66,7 +66,9 @@ decisions that unit tests structurally cannot reach:
 3. an *always* approval is written to the mounted whitelist and survives a
    container restart — which proves the volume and file ownership are right,
 4. all of the above still hold when the container is started with an overridden
-   uid and gid that exist nowhere in the image.
+   uid and gid that exist nowhere in the image, given a data directory the
+   test has made writable by that user — the arrangement an operator is
+   expected to make for themselves.
 
 That is one seam, not four, and it is a shell-level test against the image's
 external interface. It asserts nothing about how the image is layered.
@@ -176,23 +178,27 @@ approvals. That is a hard requirement, not a documented nicety.
 
 It constrains the image: nothing may depend on the default user existing in
 `/etc/passwd`, on `$HOME`, or on a uid known at build time. The binary needs no
-identity, so the only real constraint is that the **data directory must be
-writable by whatever user the operator picks**. Two mechanisms are available and
-the ticket should choose deliberately:
+identity of its own.
 
-- give `/app/data` group ownership of gid `0` and mode `0775`, the convention
-  arbitrary-uid platforms use, so any uid running with a supplementary root
-  group can write it; or
-- document that a bind-mounted host directory must be `chown`ed to the chosen
-  uid, and default compose to a named volume where first-run ownership is
-  handled for the operator.
+**Matching the mount's ownership is the operator's job, and the image does
+nothing clever about it.** The image creates `/app/data` owned by its default
+non-root user, and that is the whole of its responsibility. An operator who
+overrides the uid and gid is responsible for making the directory they mount
+writable by the user they chose. No entrypoint `chown`, no gid-`0` group trick,
+no permission fixups at startup — every one of those either needs root or
+invents policy on the operator's behalf, and neither is warranted for a
+`chown` the operator can do once on the host.
 
-Whichever is chosen, the failure it guards against is the same and is silent:
-a data directory the running user cannot write produces a server that starts,
-fetches, prompts, accepts *always* — and forgets it.
+This keeps the image simple and honest, but it makes the failure mode the
+operator's to hit, and that failure is silent: a data directory the running user
+cannot write produces a server that starts, fetches, prompts, accepts *always* —
+and forgets it. That is the case for the startup writability check below, which
+turns a mismatched mount into a clear error at deploy time rather than a
+mystery weeks later. The two decisions are a pair: the image stays out of the
+way, so it owes the operator a loud failure when they get it wrong.
 
-The container must not `chown` at startup from an entrypoint, since that would
-require starting as root and defeats the requirement.
+The compose file should document the requirement where an operator will see it,
+and the README should state it alongside the `user:` override.
 
 **Whitelist location.** The image defaults `ASKWEB_WHITELIST` to an absolute
 path under a dedicated data directory — `/app/data/whitelist.json` — rather than
@@ -206,7 +212,9 @@ into place, so it needs write permission on the containing directory, not just
 on the file. Mounting a single file also means a first run with no whitelist has
 nowhere to create one.
 
-**Fail loudly on an unwritable whitelist.** Today an unsaveable approval is
+**Fail loudly on an unwritable whitelist.** This is now load-bearing rather than
+a nicety, because the ownership contract above puts the mount in the operator's
+hands. Today an unsaveable approval is
 logged and dropped, which is correct at runtime but invisible at deploy time.
 A startup writability check is proposed so a misconfigured mount fails fast.
 This changes server behaviour and touches the whitelist module, so it should be
