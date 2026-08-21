@@ -1,21 +1,22 @@
 # askweb
 
 A whitelisted web-access MCP server. It exposes a single `web_fetch` tool whose
-reach is limited to an operator-controlled list of hostnames — any URL on any
-other host is refused, and nothing is fetched.
+reach is limited to an operator-controlled list of hostnames. Any other host has
+to be approved by a human, and is refused without that approval.
 
 It exists because general-purpose web tools give an agent unrestricted outbound
 access, which is a prompt-injection surface. `askweb` narrows that to hosts you
-named, and refuses everything else.
+named, and puts everything else in front of you before it is fetched.
 
 ## Status
 
-Ticket 01 of four is implemented: whitelisted fetch over Streamable HTTP.
+Tickets 01 and 02 of four are implemented: whitelisted fetch over Streamable
+HTTP, plus a human approval prompt for unknown hosts.
 
-Unknown hosts are currently **refused outright**. Interactive approval —
-elicitation, so a human can allow a host from a Telegram button or an editor
-dialog — is ticket 02 and is not built yet. See `.scratch/web-fetch-whitelist/`
-for the PRD and remaining tickets.
+Approving a host with **always** currently behaves the same as **once** — it
+allows that call but is not written to the whitelist file, so it will be asked
+again. Persistence is ticket 03. See `.scratch/web-fetch-whitelist/` for the PRD
+and remaining tickets.
 
 ## Install and run
 
@@ -81,7 +82,33 @@ Restarting the binary drops the MCP session, so reconnect afterwards.
 The server advertises one tool:
 
 **`web_fetch`** — takes a single `url` argument and returns the response body.
-On a non-whitelisted host it returns a tool error naming only the blocked host.
+A whitelisted host is fetched straight away. Any other host prompts you first;
+without your approval it returns an error naming only the blocked host.
+
+## Approving an unknown host
+
+A host that is not on the whitelist does not fail outright — it asks you:
+
+> Allow fetching from `docs.example.org`? It is not on the whitelist.
+>
+> **once** · **always** · **deny**
+
+- **once** — fetches this one time, remembers nothing
+- **always** — fetches, and is meant to persist the host (ticket 03; today it
+  behaves as *once*)
+- **deny** — fetches nothing
+
+Everything that is not one of the first two is a denial: declining, cancelling,
+letting the prompt expire, a transport failure, or an answer matching none of
+the choices. Nothing is retried.
+
+Your client has to be able to show the prompt. If it never declared that
+capability, an unknown host is refused rather than fetched — the question could
+not be put, so nobody approved it.
+
+The prompt is carried as a multi-round-trip input request (SEP-2322): the tool
+returns a request for input, your client asks you, and the call is retried with
+your answer. See [ADR-0005](docs/adr/0005-multi-round-trip-input-requests.md).
 
 ## How matching works
 
@@ -106,9 +133,10 @@ exists to prevent, so matching is never anything but exact.
 ## Security notes
 
 - **The model cannot approve its own fetches.** `web_fetch` takes a `url` and
-  nothing else, by design. A parameter that could influence whether a host is
-  allowed would defeat the whitelist, so any change to the tool's schema has to
-  preserve this. See ADR-0001.
+  nothing else, by design. The approval answer travels in protocol-level fields
+  written by your client, never in the tool's arguments. A parameter that could
+  influence whether a host is allowed would defeat the whitelist, so any change
+  to the tool's schema has to preserve this. See ADR-0001 and ADR-0005.
 - **Fail closed.** Any path that is not an explicit allow is a denial.
 - **Refusals disclose only the blocked host** — never the whitelist's contents.
 - **Redirects are a known gap.** A fetch that redirects to a non-whitelisted
@@ -128,6 +156,8 @@ Recorded as ADRs in [`docs/adr/`](docs/adr/):
 - [ADR-0003](docs/adr/0003-official-go-mcp-sdk.md) — the official Go MCP SDK
 - [ADR-0004](docs/adr/0004-streamable-http-transport.md) — Streamable HTTP at
   `/mcp`
+- [ADR-0005](docs/adr/0005-multi-round-trip-input-requests.md) — approval is
+  carried as a multi-round-trip input request, superseding ADR-0001's mechanism
 
 ## Development
 
@@ -140,6 +170,7 @@ Layout:
 | Package | Responsibility |
 |---|---|
 | `internal/hostname` | URL to canonical hostname. Pure, no dependencies |
+| `internal/approval` | The human approval prompt and how its answer is read |
 | `internal/whitelist` | The allowed set, loaded from JSON. Normalizes nothing |
 | `internal/config` | Flag and environment resolution |
 | `internal/server` | The MCP server and the `web_fetch` handler |

@@ -1,6 +1,6 @@
 # ADR-0003: Use the official Go MCP SDK
 
-**Status:** Accepted
+**Status:** Accepted (elicitation mechanism superseded by [ADR-0005](./0005-multi-round-trip-input-requests.md))
 **Date:** 2026-08-01
 
 ## Context

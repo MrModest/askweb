@@ -1,7 +1,8 @@
 # askweb
 
 Whitelisted web-access MCP server. Exposes a `web_fetch` tool gated by an
-exact-hostname whitelist, with MCP elicitation for approving unknown hosts.
+exact-hostname whitelist. An unknown host is put to a human for approval, as a
+multi-round-trip input request (see `docs/adr/0005-multi-round-trip-input-requests.md`).
 
 ## Agent skills
 

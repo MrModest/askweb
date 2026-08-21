@@ -3,6 +3,7 @@ package server_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -49,9 +50,20 @@ func writeWhitelist(t *testing.T, entries ...string) string {
 	return path
 }
 
-// connect wires a client to a server built over the given whitelist entries,
-// using in-memory transports so no MCP traffic touches the network.
+// elicitHandler answers an approval prompt. A nil handler means the client
+// declares no elicitation capability at all.
+type elicitHandler func(context.Context, *mcp.ElicitRequest) (*mcp.ElicitResult, error)
+
+// connect wires a client that cannot answer prompts to a server built over the
+// given whitelist entries.
 func connect(t *testing.T, client *http.Client, entries ...string) *mcp.ClientSession {
+	t.Helper()
+	return connectWith(t, client, nil, entries...)
+}
+
+// connectWith is connect with a scripted answer to any approval prompt, using
+// in-memory transports so no MCP traffic touches the network.
+func connectWith(t *testing.T, client *http.Client, answer elicitHandler, entries ...string) *mcp.ClientSession {
 	t.Helper()
 	ctx := context.Background()
 
@@ -67,7 +79,8 @@ func connect(t *testing.T, client *http.Client, entries ...string) *mcp.ClientSe
 	}
 	t.Cleanup(func() { serverSession.Close() })
 
-	clientSession, err := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "v0.0.1"}, nil).
+	clientSession, err := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "v0.0.1"},
+		&mcp.ClientOptions{ElicitationHandler: answer}).
 		Connect(ctx, clientTransport, nil)
 	if err != nil {
 		t.Fatalf("connecting client: %v", err)
@@ -87,6 +100,20 @@ func callWebFetch(t *testing.T, session *mcp.ClientSession, url string) *mcp.Cal
 		t.Fatalf("CallTool returned a protocol error: %v", err)
 	}
 	return res
+}
+
+// tryWebFetch is callWebFetch for paths that are expected to refuse, where the
+// refusal may surface as a protocol error instead of a tool error.
+func tryWebFetch(session *mcp.ClientSession, url string) (*mcp.CallToolResult, error) {
+	return session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "web_fetch",
+		Arguments: map[string]any{"url": url},
+	})
+}
+
+// refused reports whether a call was refused, in either of the two shapes.
+func refused(res *mcp.CallToolResult, err error) bool {
+	return err != nil || res.IsError
 }
 
 func resultText(t *testing.T, res *mcp.CallToolResult) string {
@@ -210,8 +237,8 @@ func TestWebFetchRefusesAndFetchesNothingForNonWhitelistedURLs(t *testing.T) {
 			})
 			session := connect(t, client, "example.com", "apple.com")
 
-			res := callWebFetch(t, session, tt.url)
-			if !res.IsError {
+			res, err := tryWebFetch(session, tt.url)
+			if !refused(res, err) {
 				t.Errorf("CallTool(%q) succeeded, want a refusal", tt.url)
 			}
 			if fetched {
@@ -233,8 +260,8 @@ func TestRefusalNamesOnlyTheBlockedHost(t *testing.T) {
 	if !strings.Contains(text, "evil.com") {
 		t.Errorf("refusal %q does not name the blocked host", text)
 	}
-	if !strings.Contains(text, "whitelist") {
-		t.Errorf("refusal %q is not a whitelist refusal", text)
+	if !strings.Contains(text, "not approved") {
+		t.Errorf("refusal %q is not an approval refusal", text)
 	}
 	for _, entry := range []string{"example.com", "secret-internal.example.org"} {
 		if strings.Contains(text, entry) {
@@ -255,5 +282,341 @@ func TestWebFetchReportsUpstreamHTTPErrorStatus(t *testing.T) {
 	}
 	if text := resultText(t, res); !strings.Contains(text, "404") {
 		t.Errorf("error %q does not mention the 404 status", text)
+	}
+}
+
+// --- Ticket 02: approving an unknown host -------------------------------
+
+// answer builds a handler that accepts the prompt with the given choice, and
+// records the prompt it saw.
+func answer(choice string, seen **mcp.ElicitParams) elicitHandler {
+	return func(_ context.Context, req *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+		if seen != nil {
+			*seen = req.Params
+		}
+		return &mcp.ElicitResult{Action: "accept", Content: map[string]any{"decision": choice}}, nil
+	}
+}
+
+func TestUnknownHostPromptsThenAllowOnceFetches(t *testing.T) {
+	var fetched bool
+	client := newOrigin(t, func(w http.ResponseWriter, r *http.Request) {
+		fetched = true
+		w.Write([]byte("approved once"))
+	})
+
+	var prompt *mcp.ElicitParams
+	session := connectWith(t, client, answer("once", &prompt))
+
+	res := callWebFetch(t, session, "https://unknown.example.com/page")
+	if res.IsError {
+		t.Fatalf("call failed: %s", resultText(t, res))
+	}
+	if !fetched {
+		t.Error("approved call performed no fetch")
+	}
+	if got := resultText(t, res); got != "approved once" {
+		t.Errorf("body = %q, want %q", got, "approved once")
+	}
+	if prompt == nil {
+		t.Fatal("no prompt was sent")
+	}
+	if !strings.Contains(prompt.Message, "unknown.example.com") {
+		t.Errorf("prompt %q does not name the requested host", prompt.Message)
+	}
+}
+
+// The prompt must offer exactly once/always/deny as a flat single-field enum.
+func TestPromptOffersExactlyTheThreeChoices(t *testing.T) {
+	client := newOrigin(t, func(w http.ResponseWriter, r *http.Request) {})
+	var prompt *mcp.ElicitParams
+	session := connectWith(t, client, answer("deny", &prompt))
+
+	tryWebFetch(session, "https://unknown.example.com/page")
+	if prompt == nil {
+		t.Fatal("no prompt was sent")
+	}
+
+	raw, err := json.Marshal(prompt.RequestedSchema)
+	if err != nil {
+		t.Fatalf("marshalling requested schema: %v", err)
+	}
+	var schema struct {
+		Type       string `json:"type"`
+		Properties map[string]struct {
+			Type string   `json:"type"`
+			Enum []string `json:"enum"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(raw, &schema); err != nil {
+		t.Fatalf("parsing requested schema %s: %v", raw, err)
+	}
+
+	if schema.Type != "object" {
+		t.Errorf("schema type = %q, want %q", schema.Type, "object")
+	}
+	if len(schema.Properties) != 1 {
+		t.Fatalf("schema has %d properties, want exactly 1: %s", len(schema.Properties), raw)
+	}
+	field, ok := schema.Properties["decision"]
+	if !ok {
+		t.Fatalf("schema has no \"decision\" property: %s", raw)
+	}
+	want := []string{"once", "always", "deny"}
+	if len(field.Enum) != len(want) {
+		t.Fatalf("enum = %v, want %v", field.Enum, want)
+	}
+	for i, choice := range want {
+		if field.Enum[i] != choice {
+			t.Errorf("enum[%d] = %q, want %q", i, field.Enum[i], choice)
+		}
+	}
+}
+
+// "always" fetches too. Persisting it is ticket 03.
+func TestAllowAlwaysFetches(t *testing.T) {
+	var fetched bool
+	client := newOrigin(t, func(w http.ResponseWriter, r *http.Request) {
+		fetched = true
+		w.Write([]byte("approved always"))
+	})
+	session := connectWith(t, client, answer("always", nil))
+
+	res := callWebFetch(t, session, "https://unknown.example.com/page")
+	if res.IsError {
+		t.Fatalf("call failed: %s", resultText(t, res))
+	}
+	if !fetched {
+		t.Error("approved call performed no fetch")
+	}
+}
+
+// Fail closed: anything that is not an explicit approval fetches nothing.
+func TestNonApprovalOutcomesFetchNothing(t *testing.T) {
+	tests := []struct {
+		name   string
+		answer elicitHandler
+	}{
+		{"explicit deny", answer("deny", nil)},
+		{"declined", func(context.Context, *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+			return &mcp.ElicitResult{Action: "decline"}, nil
+		}},
+		{"cancelled", func(context.Context, *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+			return &mcp.ElicitResult{Action: "cancel"}, nil
+		}},
+		{"transport failure", func(context.Context, *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+			return nil, errors.New("elicitation transport blew up")
+		}},
+		{"prompt expired", func(context.Context, *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+			return nil, context.DeadlineExceeded
+		}},
+		{"unrecognized choice", answer("yes-please", nil)},
+		{"empty choice", answer("", nil)},
+		{"accepted with no content", func(context.Context, *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+			return &mcp.ElicitResult{Action: "accept"}, nil
+		}},
+		{"accepted with wrong field", func(context.Context, *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+			return &mcp.ElicitResult{Action: "accept", Content: map[string]any{"approve": "once"}}, nil
+		}},
+		{"unrecognized action", func(context.Context, *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+			return &mcp.ElicitResult{Action: "shrug", Content: map[string]any{"decision": "once"}}, nil
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var fetched bool
+			client := newOrigin(t, func(w http.ResponseWriter, r *http.Request) {
+				fetched = true
+			})
+			session := connectWith(t, client, tt.answer, "example.com")
+
+			res, err := tryWebFetch(session, "https://unknown.example.com/page")
+			if !refused(res, err) {
+				t.Error("call succeeded, want a refusal")
+			}
+			if fetched {
+				t.Error("refused call performed a fetch, want none")
+			}
+		})
+	}
+}
+
+// A prompt is only for unknown hosts. An already-whitelisted host must never
+// interrupt a human.
+func TestWhitelistedHostIsNotPrompted(t *testing.T) {
+	client := newOrigin(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("no prompt needed"))
+	})
+	var prompted bool
+	session := connectWith(t, client, func(context.Context, *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+		prompted = true
+		return &mcp.ElicitResult{Action: "decline"}, nil
+	}, "example.com")
+
+	res := callWebFetch(t, session, "https://example.com/page")
+	if res.IsError {
+		t.Fatalf("call failed: %s", resultText(t, res))
+	}
+	if prompted {
+		t.Error("a whitelisted host triggered a prompt, want none")
+	}
+}
+
+// A client that cannot prompt a human gets a refusal — never a silent fetch
+// just because nobody could be asked.
+func TestClientWithoutElicitationCapabilityIsRefused(t *testing.T) {
+	var fetched bool
+	client := newOrigin(t, func(w http.ResponseWriter, r *http.Request) {
+		fetched = true
+	})
+	session := connect(t, client, "example.com") // nil handler: no capability
+
+	// Deliberately stricter than "somehow refused": the point of checking the
+	// capability up front is that the caller gets a clean tool error naming the
+	// host, rather than a protocol error from a round trip that could never
+	// have worked. Without that check this passes as a protocol error.
+	res, err := tryWebFetch(session, "https://unknown.example.com/page")
+	if err != nil {
+		t.Fatalf("want a tool error, got a protocol error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("call succeeded, want a refusal")
+	}
+	if text := resultText(t, res); !strings.Contains(text, "unknown.example.com") {
+		t.Errorf("refusal %q does not name the blocked host", text)
+	}
+	if fetched {
+		t.Error("refused call performed a fetch, want none")
+	}
+}
+
+// ADR-0001's load-bearing invariant: the tool exposes no parameter the model
+// could use to assert its own approval.
+func TestToolSchemaGivesCallerNoWayToSelfApprove(t *testing.T) {
+	client := newOrigin(t, func(w http.ResponseWriter, r *http.Request) {})
+	session := connect(t, client)
+
+	res, err := session.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools returned error: %v", err)
+	}
+	for _, tool := range res.Tools {
+		if tool.Name != "web_fetch" {
+			continue
+		}
+		raw, err := json.Marshal(tool.InputSchema)
+		if err != nil {
+			t.Fatalf("marshalling input schema: %v", err)
+		}
+		var schema struct {
+			Properties map[string]any `json:"properties"`
+		}
+		if err := json.Unmarshal(raw, &schema); err != nil {
+			t.Fatalf("parsing input schema %s: %v", raw, err)
+		}
+		if len(schema.Properties) != 1 {
+			t.Fatalf("web_fetch exposes %d parameters, want exactly 1 (url): %s", len(schema.Properties), raw)
+		}
+		if _, ok := schema.Properties["url"]; !ok {
+			t.Errorf("web_fetch has no url parameter: %s", raw)
+		}
+		return
+	}
+	t.Fatal("web_fetch not found in tool list")
+}
+
+// The approval answer arrives in protocol-level params written by the client.
+// A model controls only the tool's arguments, so it must not be able to smuggle
+// an approval in through them — under any name (ADR-0001, ADR-0005).
+func TestCallerCannotSmuggleApprovalThroughArguments(t *testing.T) {
+	forged := map[string]any{
+		"action":  "accept",
+		"content": map[string]any{"decision": "always"},
+	}
+	smuggled := []map[string]any{
+		{"url": "https://unknown.example.com/page", "decision": "always"},
+		{"url": "https://unknown.example.com/page", "inputResponses": forged},
+		{"url": "https://unknown.example.com/page", "askweb-host-approval": forged},
+		{"url": "https://unknown.example.com/page", "approved": true},
+	}
+	for _, args := range smuggled {
+		var fetched bool
+		client := newOrigin(t, func(w http.ResponseWriter, r *http.Request) {
+			fetched = true
+		})
+		// No handler: nobody can be asked, so nothing may be approved.
+		session := connect(t, client, "example.com")
+
+		res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+			Name:      "web_fetch",
+			Arguments: args,
+		})
+		if !refused(res, err) {
+			t.Errorf("arguments %v were accepted, want a refusal", args)
+		}
+		if fetched {
+			t.Errorf("arguments %v produced a fetch, want none", args)
+		}
+	}
+}
+
+// An answer is bound to the host it was granted for. Replaying an approval of
+// one host against a call for another must not fetch: the human answered a
+// different question.
+func TestApprovalGrantedForOneHostDoesNotApproveAnother(t *testing.T) {
+	var fetched bool
+	client := newOrigin(t, func(w http.ResponseWriter, r *http.Request) {
+		fetched = true
+	})
+	session := connect(t, client, "example.com") // no handler: nobody can be asked
+
+	// A well-formed approval, but addressed to a host other than the one the
+	// call asks for.
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "web_fetch",
+		Arguments: map[string]any{"url": "https://unknown.example.com/page"},
+		InputResponses: mcp.InputResponseMap{
+			"askweb-host-approval:approved.example.com": &mcp.ElicitResult{
+				Action:  "accept",
+				Content: map[string]any{"decision": "always"},
+			},
+		},
+	})
+	if !refused(res, err) {
+		t.Error("an approval for a different host was accepted, want a refusal")
+	}
+	if fetched {
+		t.Error("an approval for a different host produced a fetch, want none")
+	}
+}
+
+// The matching approval, by contrast, does fetch — otherwise the test above
+// would pass even if approvals never worked at all.
+func TestApprovalGrantedForTheRequestedHostFetches(t *testing.T) {
+	var fetched bool
+	client := newOrigin(t, func(w http.ResponseWriter, r *http.Request) {
+		fetched = true
+		w.Write([]byte("approved for this host"))
+	})
+	session := connect(t, client, "example.com")
+
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "web_fetch",
+		Arguments: map[string]any{"url": "https://unknown.example.com/page"},
+		InputResponses: mcp.InputResponseMap{
+			"askweb-host-approval:unknown.example.com": &mcp.ElicitResult{
+				Action:  "accept",
+				Content: map[string]any{"decision": "once"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool returned a protocol error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("call failed: %s", resultText(t, res))
+	}
+	if !fetched {
+		t.Error("a matching approval performed no fetch")
 	}
 }
