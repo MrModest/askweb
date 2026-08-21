@@ -111,33 +111,35 @@ implementation and rot.
     chose, so that overriding the user does not silently break *always*.
 13. As an operator, I want a shell in the image, so that I can debug outbound
     connectivity from inside the container when a fetch fails.
-14. As an operator, I want a clear startup failure when the whitelist is
+14. As an operator, I want the binary readable and executable by any uid, so
+    that overriding the user does not leave the container unable to start.
+15. As an operator, I want a clear startup failure when the whitelist is
     unwritable, so that I find out at deploy time rather than when an approval
     quietly fails to save.
-15. As an operator, I want the listen address configurable through the
+16. As an operator, I want the listen address configurable through the
     environment, so that compose can set it without a custom command.
-16. As an operator, I want outbound HTTPS to work from inside the container, so
+17. As an operator, I want outbound HTTPS to work from inside the container, so
     that fetching a whitelisted host does not fail on certificate verification.
-17. As an operator, I want the image to carry no build toolchain, source, or
+18. As an operator, I want the image to carry no build toolchain, source, or
     package cache, so that the attack surface stays small.
-18. As an operator, I want the image to carry provenance labels back to the
+19. As an operator, I want the image to carry provenance labels back to the
     commit it was built from, so that I can trace a running container to source.
-19. As a maintainer, I want the test suite run on every pull request, so that a
+20. As a maintainer, I want the test suite run on every pull request, so that a
     regression in the whitelist gate cannot merge.
-20. As a maintainer, I want the race detector enabled in CI, so that concurrent
+21. As a maintainer, I want the race detector enabled in CI, so that concurrent
     access to the whitelist store stays safe.
-21. As a maintainer, I want formatting and vet checked in CI, so that style
+22. As a maintainer, I want formatting and vet checked in CI, so that style
     review is not a human job.
-22. As a maintainer, I want the container smoke test in CI, so that a broken
+23. As a maintainer, I want the container smoke test in CI, so that a broken
     image is caught before it is published rather than by an operator.
-23. As a maintainer, I want third-party actions pinned by digest, so that the
+24. As a maintainer, I want third-party actions pinned by digest, so that the
     release pipeline is not a supply-chain hole in a security tool.
-24. As a maintainer, I want build cache between runs, so that CI stays fast.
-25. As a maintainer, I want the image built on pull requests without being
+25. As a maintainer, I want build cache between runs, so that CI stays fast.
+26. As a maintainer, I want the image built on pull requests without being
     pushed, so that a Dockerfile break is caught without publishing.
-26. As a Hermes operator, I want `askweb` reachable on a compose network by
+27. As a Hermes operator, I want `askweb` reachable on a compose network by
     service name, so that I can attach it to the Hermes stack.
-27. As a maintainer, I want the README to document the container path, so that
+28. As a maintainer, I want the README to document the container path, so that
     the compose file is not the only place the deployment is described.
 
 ## Implementation Decisions
@@ -199,6 +201,32 @@ way, so it owes the operator a loud failure when they get it wrong.
 
 The compose file should document the requirement where an operator will see it,
 and the README should state it alongside the `user:` override.
+
+**Dockerfile conventions.** Follow the reference repo's frontend Dockerfile
+(`apps/frontend/Dockerfile` in `reisenotiz`): the `# syntax=docker/dockerfile:1`
+directive, banner-commented build and runtime stages, explicit `COPY` of the
+paths needed rather than `COPY . .`, OCI `org.opencontainers.image.*` labels for
+traceability, and an `EXPOSE` matching the default listen port.
+
+**Arbitrary-uid support, borrowed from that reference and where it stops.** The
+reference makes everything the runtime user touches world-readable at build
+time — `chmod -R a+r`, plus `a+rx` on directories — under a temporary
+`USER root`, then drops back to a non-root `USER`. That is what lets it run
+under a uid nobody knew at build time, and the same treatment applies here to
+the binary and the directory holding it: an image whose binary is readable and
+executable only by its default user cannot run under `user: "1003:1002"` at all.
+
+It does not extend to the data directory. Nginx only reads its files, so
+world-readable is enough; `askweb` writes the whitelist, and no build-time mode
+makes a path writable by an unknown future uid short of `0777` — which is not a
+reasonable mode for the directory holding the security boundary. This is the
+concrete reason the mount's ownership sits with the operator: the read half of
+arbitrary-uid support is the image's job and is handled the reference's way, and
+the write half is a `chown` only the operator can make correctly.
+
+**Unprivileged port.** The default listen port stays `8080` and nothing binds
+below 1024, since a non-root user cannot. The reference base image
+(`nginx-unprivileged`) makes the same choice for the same reason.
 
 **Whitelist location.** The image defaults `ASKWEB_WHITELIST` to an absolute
 path under a dedicated data directory — `/app/data/whitelist.json` — rather than
@@ -306,8 +334,9 @@ failure at runtime.
 
 ## Further Notes
 
-The reference the workflows are modelled on is
-`https://github.com/MrModest/reisenotiz/tree/main/.github/workflows`. Its
+The reference for both the workflows and the Dockerfile is
+`https://github.com/MrModest/reisenotiz` — `.github/workflows` and
+`apps/frontend/Dockerfile`. Its
 conventions worth carrying over: `ghcr.io`, `docker/metadata-action` tagging,
 digest-pinned third-party actions, GitHub Actions build cache, and path filters
 on triggers. Its conventions worth dropping: the reusable workflow indirection
