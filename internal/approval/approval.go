@@ -50,11 +50,18 @@ const (
 	choiceDeny   = "deny"
 )
 
-// Request builds the prompt asking whether host may be fetched. Returning it
+// Request builds the prompt asking whether hosts may be fetched. Returning it
 // from a tool handler suspends the call until a human answers.
-func Request(host string) mcp.InputRequestMap {
-	return mcp.InputRequestMap{
-		requestID(host): &mcp.ElicitParams{
+//
+// Asking about several hosts at once is how a chain of redirects keeps the
+// approvals it has already been given. A client answers the questions in the
+// map it was last handed and sends those answers back together, replacing what
+// it sent before — so a host left out of a later prompt is a host whose
+// approval is gone by the time the call is retried.
+func Request(hosts ...string) mcp.InputRequestMap {
+	requests := make(mcp.InputRequestMap, len(hosts))
+	for _, host := range hosts {
+		requests[requestID(host)] = &mcp.ElicitParams{
 			Message: fmt.Sprintf("Allow fetching from %s? It is not on the whitelist.", host),
 			RequestedSchema: &jsonschema.Schema{
 				Type: "object",
@@ -67,8 +74,9 @@ func Request(host string) mcp.InputRequestMap {
 				},
 				Required: []string{field},
 			},
-		},
+		}
 	}
+	return requests
 }
 
 // Decide reads the human's answer about host out of a retried call's input
@@ -101,4 +109,16 @@ func ClientCanPrompt(session *mcp.ServerSession) bool {
 	// before initialize reaches this code. Treat that as "cannot prompt".
 	params := session.InitializeParams()
 	return params != nil && params.Capabilities != nil && params.Capabilities.Elicitation != nil
+}
+
+// Answered reports whether responses carry an answer about host — any answer,
+// including a refusal.
+//
+// It separates "this host has not been put to a human yet" from "a human said
+// no", which a chain of redirects makes distinct: a retry carrying approval for
+// one hop says nothing at all about the next one, and that hop still has to be
+// asked rather than assumed refused.
+func Answered(responses mcp.InputResponseMap, host string) bool {
+	_, ok := responses[requestID(host)]
+	return ok
 }

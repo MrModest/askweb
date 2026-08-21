@@ -10,12 +10,11 @@ named, and puts everything else in front of you before it is fetched.
 
 ## Status
 
-Tickets 01 through 03 of four are implemented: whitelisted fetch over Streamable
-HTTP, a human approval prompt for unknown hosts, and persistence of hosts
-approved with **always**.
+All four tickets are implemented: whitelisted fetch over Streamable HTTP, a
+human approval prompt for unknown hosts, persistence of hosts approved with
+**always**, and re-validation of every redirect hop.
 
-Ticket 04 remains — a fetch that redirects to a non-whitelisted host still
-follows the redirect. See `.scratch/web-fetch-whitelist/` for the PRD.
+See `.scratch/web-fetch-whitelist/` for the PRD.
 
 ## Install and run
 
@@ -128,6 +127,28 @@ The prompt is carried as a multi-round-trip input request (SEP-2322): the tool
 returns a request for input, your client asks you, and the call is retried with
 your answer. See [ADR-0005](docs/adr/0005-multi-round-trip-input-requests.md).
 
+## Redirects
+
+A redirect is not a shortcut around the whitelist. Redirects are followed one
+hop at a time, and each hop is checked exactly like the URL you asked for: a
+whitelisted target is followed, an unknown one asks you first, and a refusal
+ends the whole request with no body at all. The gate runs before each hop is
+requested, so a host you turn down is never contacted.
+
+Choosing **always** on a redirect saves the host that redirect points at — the
+one you were asked about — not the one that sent you there.
+
+Chains are bounded at ten hops, so a site that redirects to itself fails instead
+of spinning.
+
+If a chain needs you to approve more than one host, you are asked about the
+earlier ones again alongside the new one — two unknown hops means three prompts.
+That repetition is deliberate: your client sends back only the answers to the
+questions it was last asked, so a host left out of a later prompt would have its
+approval dropped and the chain would stall
+([ADR-0006](docs/adr/0006-per-hop-redirect-gating.md)). Answering **always**
+avoids the repeat, since the host is on the whitelist by the next round.
+
 ## How matching works
 
 Every URL is canonicalized by one pure function before anything else happens: it
@@ -160,9 +181,8 @@ exists to prevent, so matching is never anything but exact.
   the file, and an approval that cannot be saved is not remembered at all —
   never allowed in memory while missing from disk.
 - **Refusals disclose only the blocked host** — never the whitelist's contents.
-- **Redirects are a known gap.** A fetch that redirects to a non-whitelisted
-  host currently follows it, bypassing the gate. Tracked as ticket 04. Until
-  then, treat whitelisted hosts as trusted not to redirect somewhere hostile.
+- **Redirects are checked hop by hop.** A whitelisted host that redirects
+  elsewhere does not smuggle that host past the gate — see below.
 - **No response size limit or content-type filtering** yet — out of scope for
   now.
 
@@ -179,6 +199,8 @@ Recorded as ADRs in [`docs/adr/`](docs/adr/):
   `/mcp`
 - [ADR-0005](docs/adr/0005-multi-round-trip-input-requests.md) — approval is
   carried as a multi-round-trip input request, superseding ADR-0001's mechanism
+- [ADR-0006](docs/adr/0006-per-hop-redirect-gating.md) — every redirect hop is
+  checked against the whitelist
 
 ## Development
 

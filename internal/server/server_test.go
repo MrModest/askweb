@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -796,5 +798,503 @@ func TestApprovedCallSucceedsWhenTheWhitelistCannotBeSaved(t *testing.T) {
 	}
 	if prompts != 2 {
 		t.Errorf("asked %d times, want 2 — an unsaved approval must not be remembered", prompts)
+	}
+}
+
+// --- Ticket 04: re-validating redirect targets --------------------------
+
+// byHost stands one local origin in for several hostnames. Every connection
+// lands on the same server, so the Host header is what tells them apart —
+// which is what lets a redirect chain across hosts stay in-process. An
+// unlisted host is a test failure: the chain reached somewhere it should not.
+func byHost(t *testing.T, handlers map[string]http.HandlerFunc) *http.Client {
+	t.Helper()
+	return newOrigin(t, func(w http.ResponseWriter, r *http.Request) {
+		host := r.Host
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		handler, ok := handlers[host]
+		if !ok {
+			t.Errorf("unexpected request for host %q", r.Host)
+			http.Error(w, "no route", http.StatusNotFound)
+			return
+		}
+		handler(w, r)
+	})
+}
+
+// redirectTo answers with a 302 pointing at url.
+func redirectTo(url string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, url, http.StatusFound)
+	}
+}
+
+func serves(text string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(text))
+	}
+}
+
+func TestRedirectToWhitelistedHostIsFollowed(t *testing.T) {
+	client := byHost(t, map[string]http.HandlerFunc{
+		"example.com":       redirectTo("https://other.example.com/moved"),
+		"other.example.com": serves("body from the redirect target"),
+	})
+	session := connect(t, client, "example.com", "other.example.com")
+
+	res := callWebFetch(t, session, "https://example.com/page")
+	if res.IsError {
+		t.Fatalf("call failed: %s", resultText(t, res))
+	}
+	if got := resultText(t, res); got != "body from the redirect target" {
+		t.Errorf("body = %q, want the redirect target's body", got)
+	}
+}
+
+// The gap ticket 04 closes: a whitelisted host redirecting somewhere unknown
+// must put the target to a human, and must not be requested before they agree.
+func TestRedirectToUnknownHostPromptsBeforeBeingFollowed(t *testing.T) {
+	var reached bool
+	client := byHost(t, map[string]http.HandlerFunc{
+		"example.com": redirectTo("https://unknown.example.com/moved"),
+		"unknown.example.com": func(w http.ResponseWriter, r *http.Request) {
+			reached = true
+			w.Write([]byte("body from the unapproved host"))
+		},
+	})
+
+	var prompt *mcp.ElicitParams
+	session := connectWith(t, client, answer("once", &prompt), "example.com")
+
+	res := callWebFetch(t, session, "https://example.com/page")
+	if res.IsError {
+		t.Fatalf("call failed: %s", resultText(t, res))
+	}
+	if prompt == nil {
+		t.Fatal("the redirect target was followed without asking anyone")
+	}
+	if !strings.Contains(prompt.Message, "unknown.example.com") {
+		t.Errorf("prompt %q does not name the redirect target", prompt.Message)
+	}
+	if !reached {
+		t.Error("the approved redirect target was never fetched")
+	}
+	if got := resultText(t, res); got != "body from the unapproved host" {
+		t.Errorf("body = %q, want the approved target's body", got)
+	}
+}
+
+// "always" on a redirect must keep the host that was actually asked about —
+// the target — and must not widen the whitelist to anything else.
+func TestAlwaysOnARedirectPersistsTheRedirectTarget(t *testing.T) {
+	client := byHost(t, map[string]http.HandlerFunc{
+		"example.com":         redirectTo("https://unknown.example.com/moved"),
+		"unknown.example.com": serves("persisted target"),
+	})
+	store, path := loadStore(t, "example.com")
+	session := connectTo(t, client, answer("always", nil), store)
+
+	if res := callWebFetch(t, session, "https://example.com/page"); res.IsError {
+		t.Fatalf("call failed: %s", resultText(t, res))
+	}
+
+	want := []string{"example.com", "unknown.example.com"}
+	if got := savedHosts(t, path); !slices.Equal(got, want) {
+		t.Errorf("saved whitelist = %v, want %v", got, want)
+	}
+}
+
+// Refusing a hop refuses the whole request: no body, and above all no request
+// to the host that was turned down.
+func TestRefusedRedirectFetchesNothingFromTheUnapprovedHost(t *testing.T) {
+	tests := []struct {
+		name   string
+		answer elicitHandler
+	}{
+		{"deny", answer("deny", nil)},
+		{"declined", func(context.Context, *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+			return &mcp.ElicitResult{Action: "decline"}, nil
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var reached bool
+			client := byHost(t, map[string]http.HandlerFunc{
+				"example.com": redirectTo("https://unknown.example.com/moved"),
+				"unknown.example.com": func(w http.ResponseWriter, r *http.Request) {
+					reached = true
+					w.Write([]byte("secret from the unapproved host"))
+				},
+			})
+			session := connectWith(t, client, tt.answer, "example.com")
+
+			res, err := tryWebFetch(session, "https://example.com/page")
+			if !refused(res, err) {
+				t.Error("a refused redirect succeeded, want a refusal")
+			}
+			if reached {
+				t.Error("the refused host was fetched anyway")
+			}
+			if err == nil && strings.Contains(resultText(t, res), "secret") {
+				t.Errorf("result %q carries content from the refused host", resultText(t, res))
+			}
+		})
+	}
+}
+
+// The check is per hop, not per call: an unknown host three hops down the
+// chain is caught exactly like one named in the original URL.
+func TestEveryHopInAChainIsChecked(t *testing.T) {
+	client := byHost(t, map[string]http.HandlerFunc{
+		"example.com":         redirectTo("https://one.example.com/a"),
+		"one.example.com":     redirectTo("https://two.example.com/b"),
+		"two.example.com":     redirectTo("https://unknown.example.com/c"),
+		"unknown.example.com": serves("end of the chain"),
+	})
+	var prompt *mcp.ElicitParams
+	session := connectWith(t, client, answer("once", &prompt),
+		"example.com", "one.example.com", "two.example.com")
+
+	res := callWebFetch(t, session, "https://example.com/page")
+	if res.IsError {
+		t.Fatalf("call failed: %s", resultText(t, res))
+	}
+	if prompt == nil {
+		t.Fatal("the last hop was followed without asking anyone")
+	}
+	if !strings.Contains(prompt.Message, "unknown.example.com") {
+		t.Errorf("prompt %q does not name the unknown hop", prompt.Message)
+	}
+	if got := resultText(t, res); got != "end of the chain" {
+		t.Errorf("body = %q, want the chain's final body", got)
+	}
+}
+
+// An unknown hop in the middle is gated before it is requested, even though a
+// whitelisted host lies beyond it.
+func TestUnknownMiddleHopIsGated(t *testing.T) {
+	var reached bool
+	client := byHost(t, map[string]http.HandlerFunc{
+		"example.com": redirectTo("https://unknown.example.com/middle"),
+		"unknown.example.com": func(w http.ResponseWriter, r *http.Request) {
+			reached = true
+			http.Redirect(w, r, "https://last.example.com/end", http.StatusMovedPermanently)
+		},
+		"last.example.com": serves("past the middle"),
+	})
+	session := connect(t, client, "example.com", "last.example.com") // nobody can be asked
+
+	res, err := tryWebFetch(session, "https://example.com/page")
+	if !refused(res, err) {
+		t.Error("an unknown middle hop was followed, want a refusal")
+	}
+	if reached {
+		t.Error("the unapproved middle hop was fetched")
+	}
+}
+
+// Fail closed on a redirect too: no prompt possible means the hop is refused,
+// never followed on the grounds that nobody could be asked.
+func TestUnknownRedirectIsRefusedWhenNobodyCanBePrompted(t *testing.T) {
+	var reached bool
+	client := byHost(t, map[string]http.HandlerFunc{
+		"example.com": redirectTo("https://unknown.example.com/moved"),
+		"unknown.example.com": func(w http.ResponseWriter, r *http.Request) {
+			reached = true
+		},
+	})
+	session := connect(t, client, "example.com") // nil handler: no capability
+
+	res, err := tryWebFetch(session, "https://example.com/page")
+	if err != nil {
+		t.Fatalf("want a tool error, got a protocol error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("call succeeded, want a refusal")
+	}
+	if text := resultText(t, res); !strings.Contains(text, "unknown.example.com") {
+		t.Errorf("refusal %q does not name the blocked redirect target", text)
+	}
+	if reached {
+		t.Error("the refused host was fetched anyway")
+	}
+}
+
+// A redirect loop between whitelisted hosts terminates rather than spinning.
+func TestRedirectChainIsBounded(t *testing.T) {
+	// The loop stops itself well past the bound, so a missing bound fails the
+	// test outright instead of hanging it.
+	const giveUp = 25
+	var requests int
+	client := byHost(t, map[string]http.HandlerFunc{
+		"example.com": func(w http.ResponseWriter, r *http.Request) {
+			requests++
+			if requests > giveUp {
+				w.Write([]byte("the chain was never cut short"))
+				return
+			}
+			http.Redirect(w, r, "https://example.com/again", http.StatusFound)
+		},
+	})
+	session := connect(t, client, "example.com")
+
+	res, err := tryWebFetch(session, "https://example.com/page")
+	if !refused(res, err) {
+		t.Error("an endless redirect loop returned a result, want an error")
+	}
+	if requests > 11 {
+		t.Errorf("followed %d requests, want a bound of at most 11", requests)
+	}
+	if requests < 2 {
+		t.Errorf("followed %d requests, want redirects to be followed at all", requests)
+	}
+}
+
+// Two unknown hops, each allowed only for this call. The client replaces the
+// answers it sends on every retry, so the second question has to repeat the
+// first one — otherwise hop one's approval would be gone by the time hop two
+// was answered, and the chain could never complete.
+func TestChainOfUnknownHostsCompletesWithOnce(t *testing.T) {
+	client := byHost(t, map[string]http.HandlerFunc{
+		"example.com":        redirectTo("https://first.example.com/a"),
+		"first.example.com":  redirectTo("https://second.example.com/b"),
+		"second.example.com": serves("both approved once"),
+	})
+	// The client fulfils every question in one round in parallel, so the tally
+	// is written from several goroutines at once.
+	var mu sync.Mutex
+	asked := map[string]int{}
+	session := connectWith(t, client, func(_ context.Context, req *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+		mu.Lock()
+		for _, host := range []string{"first.example.com", "second.example.com"} {
+			if strings.Contains(req.Params.Message, host) {
+				asked[host]++
+			}
+		}
+		mu.Unlock()
+		return &mcp.ElicitResult{Action: "accept", Content: map[string]any{"decision": "once"}}, nil
+	}, "example.com")
+
+	res := callWebFetch(t, session, "https://example.com/page")
+	if res.IsError {
+		t.Fatalf("call failed: %s", resultText(t, res))
+	}
+	if got := resultText(t, res); got != "both approved once" {
+		t.Errorf("body = %q, want the chain's final body", got)
+	}
+	// Hop one is asked about twice: once on its own, then again beside hop two.
+	// That repetition is the price of the approval surviving to the last round.
+	mu.Lock()
+	defer mu.Unlock()
+	if asked["first.example.com"] != 2 || asked["second.example.com"] != 1 {
+		t.Errorf("asked %v, want first.example.com twice and second.example.com once", asked)
+	}
+}
+
+// Nothing is recorded when the whitelist cannot be written, so an "always" is
+// no more durable than a "once" — and a later hop has to repeat it just the
+// same, or the chain stalls.
+func TestChainCompletesWhenAnAlwaysApprovalCannotBeSaved(t *testing.T) {
+	log.SetOutput(io.Discard)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	client := byHost(t, map[string]http.HandlerFunc{
+		"example.com":        redirectTo("https://first.example.com/a"),
+		"first.example.com":  redirectTo("https://second.example.com/b"),
+		"second.example.com": serves("approved but unsaved"),
+	})
+	// A path under a directory that does not exist: readable as empty, unwritable.
+	store, err := whitelist.Load(filepath.Join(t.TempDir(), "no-such-dir", "whitelist.json"))
+	if err != nil {
+		t.Fatalf("loading whitelist: %v", err)
+	}
+	if err := store.Add("example.com"); err == nil {
+		t.Fatal("the store saved to an unwritable path, so this test proves nothing")
+	}
+
+	session := connectTo(t, client, answer("always", nil), store)
+
+	res := callWebFetch(t, session, "https://example.com/page")
+	if res.IsError {
+		t.Fatalf("call failed: %s", resultText(t, res))
+	}
+	if got := resultText(t, res); got != "approved but unsaved" {
+		t.Errorf("body = %q, want the chain's final body", got)
+	}
+}
+
+// The same chain does complete when the first hop is kept with "always": the
+// approval is on disk by the retry, so only one question is outstanding.
+func TestChainOfUnknownHostsCompletesWithAlways(t *testing.T) {
+	client := byHost(t, map[string]http.HandlerFunc{
+		"example.com":        redirectTo("https://first.example.com/a"),
+		"first.example.com":  redirectTo("https://second.example.com/b"),
+		"second.example.com": serves("both approved"),
+	})
+	store, path := loadStore(t, "example.com")
+	session := connectTo(t, client, answer("always", nil), store)
+
+	res := callWebFetch(t, session, "https://example.com/page")
+	if res.IsError {
+		t.Fatalf("call failed: %s", resultText(t, res))
+	}
+	if got := resultText(t, res); got != "both approved" {
+		t.Errorf("body = %q, want the chain's final body", got)
+	}
+	want := []string{"example.com", "first.example.com", "second.example.com"}
+	if got := savedHosts(t, path); !slices.Equal(got, want) {
+		t.Errorf("saved whitelist = %v, want %v", got, want)
+	}
+}
+
+// Every redirect status the Go client would itself have followed is followed
+// here too, so gating changes which host is reached, not which responses count
+// as redirects.
+func TestEveryRedirectStatusIsFollowed(t *testing.T) {
+	for _, status := range []int{
+		http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther,
+		http.StatusTemporaryRedirect, http.StatusPermanentRedirect,
+	} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			client := byHost(t, map[string]http.HandlerFunc{
+				"example.com": func(w http.ResponseWriter, r *http.Request) {
+					http.Redirect(w, r, "https://other.example.com/moved", status)
+				},
+				"other.example.com": serves("followed"),
+			})
+			session := connect(t, client, "example.com", "other.example.com")
+
+			res := callWebFetch(t, session, "https://example.com/page")
+			if res.IsError {
+				t.Fatalf("call failed: %s", resultText(t, res))
+			}
+			if got := resultText(t, res); got != "followed" {
+				t.Errorf("body = %q, want the redirect target's body", got)
+			}
+		})
+	}
+}
+
+// A relative Location resolves against the URL it came from, so a same-host
+// redirect stays on that host instead of failing to parse.
+func TestRelativeRedirectStaysOnTheSameHost(t *testing.T) {
+	client := byHost(t, map[string]http.HandlerFunc{
+		"example.com": func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/elsewhere" {
+				w.Write([]byte("arrived via a relative hop"))
+				return
+			}
+			http.Redirect(w, r, "/elsewhere", http.StatusFound)
+		},
+	})
+	session := connect(t, client, "example.com")
+
+	res := callWebFetch(t, session, "https://example.com/page")
+	if res.IsError {
+		t.Fatalf("call failed: %s", resultText(t, res))
+	}
+	if got := resultText(t, res); got != "arrived via a relative hop" {
+		t.Errorf("body = %q, want the relative target's body", got)
+	}
+}
+
+// A redirect naming no usable target is not a redirect. It falls through to the
+// status check and fails there, rather than being followed to nowhere.
+func TestRedirectWithoutAUsableLocationIsNotFollowed(t *testing.T) {
+	for _, location := range []string{"", ":://not a url"} {
+		client := byHost(t, map[string]http.HandlerFunc{
+			"example.com": func(w http.ResponseWriter, r *http.Request) {
+				if location != "" {
+					w.Header().Set("Location", location)
+				}
+				w.WriteHeader(http.StatusFound)
+			},
+		})
+		session := connect(t, client, "example.com")
+
+		res, err := tryWebFetch(session, "https://example.com/page")
+		if !refused(res, err) {
+			t.Errorf("Location %q produced a result, want an error", location)
+		}
+	}
+}
+
+// The gate reads the hop's host, not its scheme, so a cross-scheme redirect is
+// checked like any other — and a scheme that is not http or https is refused
+// outright by canonicalization.
+func TestRedirectScheme(t *testing.T) {
+	tests := []struct {
+		name     string
+		location string
+		want     string
+	}{
+		{"to http", "http://unknown.example.com/moved", "unknown.example.com"},
+		{"to a non-web scheme", "file:///etc/passwd", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var reached bool
+			client := byHost(t, map[string]http.HandlerFunc{
+				"example.com": redirectTo(tt.location),
+				"unknown.example.com": func(w http.ResponseWriter, r *http.Request) {
+					reached = true
+				},
+			})
+			var prompt *mcp.ElicitParams
+			session := connectWith(t, client, answer("deny", &prompt), "example.com")
+
+			res, err := tryWebFetch(session, "https://example.com/page")
+			if !refused(res, err) {
+				t.Error("call succeeded, want a refusal")
+			}
+			if reached {
+				t.Error("the redirect target was fetched")
+			}
+			switch {
+			case tt.want == "" && prompt != nil:
+				t.Errorf("a %s target was put to a human as %q", tt.name, prompt.Message)
+			case tt.want != "" && prompt == nil:
+				t.Fatalf("the %s target was never put to a human", tt.name)
+			case tt.want != "" && !strings.Contains(prompt.Message, tt.want):
+				t.Errorf("prompt %q does not name %q", prompt.Message, tt.want)
+			}
+		})
+	}
+}
+
+// An answer about the wrong host is not an answer about this one. It is asked
+// about properly rather than taken as a refusal — and never taken as consent.
+func TestApprovalForAnotherHostIsAskedAboutAgain(t *testing.T) {
+	var fetched bool
+	client := newOrigin(t, func(w http.ResponseWriter, r *http.Request) {
+		fetched = true
+		w.Write([]byte("fetched"))
+	})
+	var prompt *mcp.ElicitParams
+	session := connectWith(t, client, answer("deny", &prompt), "example.com")
+
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "web_fetch",
+		Arguments: map[string]any{"url": "https://unknown.example.com/page"},
+		InputResponses: mcp.InputResponseMap{
+			"askweb-host-approval:approved.example.com": &mcp.ElicitResult{
+				Action:  "accept",
+				Content: map[string]any{"decision": "always"},
+			},
+		},
+	})
+	if !refused(res, err) {
+		t.Error("an approval for a different host was accepted, want a refusal")
+	}
+	if fetched {
+		t.Error("an approval for a different host produced a fetch, want none")
+	}
+	if prompt == nil {
+		t.Fatal("the requested host was never put to a human")
+	}
+	if !strings.Contains(prompt.Message, "unknown.example.com") {
+		t.Errorf("prompt %q asks about the wrong host", prompt.Message)
 	}
 }

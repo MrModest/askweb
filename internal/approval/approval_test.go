@@ -103,3 +103,29 @@ func TestRequestAsksAboutTheGivenHost(t *testing.T) {
 		t.Errorf("Request is not keyed by the host it asks about: %v", requests)
 	}
 }
+
+// Answered is about presence, not permission: a refusal is still an answer,
+// and an answer about another host is not one about this host.
+func TestAnsweredDistinguishesUnaskedFromRefused(t *testing.T) {
+	tests := []struct {
+		name      string
+		responses mcp.InputResponseMap
+		want      bool
+	}{
+		{"nothing sent", nil, false},
+		{"nothing about this host", mcp.InputResponseMap{}, false},
+		{"answer about another host", mcp.InputResponseMap{
+			requestID("other.example.com"): &mcp.ElicitResult{Action: "accept"},
+		}, false},
+		{"approved", accepted(choiceOnce), true},
+		{"refused", accepted(choiceDeny), true},
+		{"declined", mcp.InputResponseMap{
+			requestID(host): &mcp.ElicitResult{Action: "decline"},
+		}, true},
+	}
+	for _, tt := range tests {
+		if got := Answered(tt.responses, host); got != tt.want {
+			t.Errorf("Answered(%s) = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+}
