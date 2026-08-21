@@ -129,3 +129,23 @@ prototype runs; do not re-research from scratch.
 
 Claude Code CLI 2.1.76+ supports elicitation and is a valid local test client
 for the wire protocol, but cannot answer any of the three questions above.
+
+### Resolved empirically — 2026-08-21, Claude Code CLI
+
+Observed against the ticket-02 build, so these need no further research.
+
+- **A server may not initiate elicitation while serving a request.** Protocol
+  version 2026-07-28 rejects it outright; the interaction has to be returned
+  from the call as an `InputRequests` map (SEP-2322). See
+  [ADR-0005](../../docs/adr/0005-multi-round-trip-input-requests.md).
+- **The flat enum renders as two levels, not three buttons.** Claude Code shows
+  a collapsed `decision` field that expands (`→`) into radio options
+  `once`/`always`/`deny`, with a separate `Accept`/`Decline` layer above it.
+  ADR-0001 assumed a single flat prompt. Behaviour is unaffected, but *deny* is
+  reachable two ways — choosing `deny` then Accept, or Decline — and this is the
+  shape Hermes's Telegram buttons have to express.
+- **The required field is enforced client-side.** Accept is refused while
+  `decision` is unset, so an accepted-but-empty answer never reaches the server
+  from this client. The server still denies that case; a button UI may not
+  enforce it the same way.
+- **Declining denies and fetches nothing**, as designed.
