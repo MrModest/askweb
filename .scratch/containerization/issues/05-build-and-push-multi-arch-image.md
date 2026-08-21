@@ -26,12 +26,58 @@ this is a security tool and its pipeline should not be its weakest link.
 
 **Status:** ready-for-agent
 
-- [ ] A merge to `main` publishes the image to `ghcr.io` under the repository owner
-- [ ] The published tag runs on both `amd64` and `arm64` from a single manifest list
-- [ ] `edge` and a short-SHA tag are published on merges to `main`
-- [ ] Pushing a version tag publishes the corresponding semver tags
-- [ ] A pull request builds the image but publishes nothing
-- [ ] A failing test job means no image is built or pushed
-- [ ] A failing smoke test means no image is pushed
-- [ ] Third-party actions are pinned by commit digest
-- [ ] Build cache is reused between runs
+- [x] A merge to `main` publishes the image to `ghcr.io` under the repository owner
+- [x] The published tag runs on both `amd64` and `arm64` from a single manifest list
+- [x] `edge` and a short-SHA tag are published on merges to `main`
+- [x] Pushing a version tag publishes the corresponding semver tags
+- [x] A pull request builds the image but publishes nothing
+- [x] A failing test job means no image is built or pushed
+- [x] A failing smoke test means no image is pushed
+- [x] Third-party actions are pinned by commit digest
+- [x] Build cache is reused between runs
+
+## Comments
+
+Implemented as a `publish` job in the ticket 01 workflow, `needs: [test, smoke]`.
+The push trigger gained `tags: ["v*"]` so a version tag runs the same pipeline
+and publishes semver tags.
+
+One job builds both architectures with `platforms: linux/amd64,linux/arm64` and
+publishes a single manifest list — no per-architecture tags. No emulator is
+involved: the Dockerfile's build stage takes BuildKit's `TARGETARCH` and Go
+cross-compiles. Verified directly, since the local Docker daemon could not do a
+multi-platform build (see below): `CGO_ENABLED=0 GOOS=linux GOARCH=...` produces
+`ELF 64-bit ... x86-64, statically linked` and `ELF 64-bit ... ARM aarch64,
+statically linked` from this tree. The runtime stage only installs a package and
+copies that binary, so it carries no architecture-specific step of its own.
+
+Tags follow the reference repo: `type=edge,branch=main`, `type=sha,format=short`,
+and two semver patterns. `docker/metadata-action` lowercases the image name, so
+`ghcr.io/${{ github.repository }}` publishes as `ghcr.io/mrmodest/askweb`, which
+is what `docker-compose.yml` already points at.
+
+A pull request runs the whole job but with `push: false`, so a broken Dockerfile
+or a broken cross-build fails the PR without publishing anything. The login step
+is skipped on pull requests, which also keeps it working from forks, whose token
+could not log in.
+
+`packages: write` is set at the job level. The workflow floor is
+`contents: read`, which does not grant it.
+
+All four Docker actions are pinned by full commit digest, each reverse-verified
+against the tag it claims. Build cache is `type=gha` with `mode=max`.
+
+**What is not verified locally.** The publishing criteria are observable only
+once this runs on GitHub: that a merge to `main` really pushes `edge` and the
+short SHA, that a version tag pushes semver, and that the manifest list carries
+both architectures. The gating is structural rather than observed — `needs:`
+means a red test or smoke job cannot be followed by a push.
+
+The local Docker daemon could not confirm the multi-platform build itself: the
+`docker` driver refuses multi-platform builds, and a `docker-container` builder
+failed with `input/output error` from the VM's overlay2 store, which also
+reported negative container sizes. That is a sick Docker Desktop VM rather than
+anything about this Dockerfile — the single-architecture build and the full
+smoke test had both passed minutes earlier on the same daemon. Worth re-running
+`docker buildx build --platform linux/amd64,linux/arm64` after a Docker Desktop
+restart, before relying on the first CI run to find a problem.
