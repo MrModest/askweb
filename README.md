@@ -152,11 +152,12 @@ prompt would have its approval dropped and the chain would stall
 is saved before the call is retried, so the earlier host is whitelisted rather
 than asked about again, and every round carries a single question.
 
-That is not only tidier — some clients need it. A round carrying two questions
-at once is well-formed under SEP-2322, but not every client renders one; Claude
-Code returns an empty result rather than prompting, which makes a two-unknown-hop
-chain unusable with `once` there. Answering `always` keeps each round to one
-question and works everywhere.
+That is not only tidier — today it is the only thing that works. A round
+carrying two questions at once is well-formed under SEP-2322, but a client on a
+protocol older than 2026-07-28 never gets to see it: the SDK bridges the first
+question to the client and then reinvokes the tool exactly once, so a second
+round comes back as an empty result the client cannot act on. Answering `always`
+keeps each round to a single question, which every client handles.
 
 ## How matching works
 

@@ -157,16 +157,23 @@ specified against a real client and real redirects: a whitelisted host that
 redirects to an unapproved one is caught and refused naming only the redirect
 target, and a redirect to a whitelisted host is followed with no second prompt.
 
-- **This client does not surface a round carrying more than one input request.**
-  A chain with two unknown hops makes the server return two questions in one
-  round — the repeat that keeps the earlier approval alive
-  ([ADR-0006](../../docs/adr/0006-per-hop-redirect-gating.md)). Claude Code
-  returns an empty result instead of prompting: no content, no error, no
-  questions shown. Verified with curl that the server's response is well-formed
-  and that answering both questions completes the chain correctly, so this is a
-  client limitation rather than a server defect. The Go SDK's client middleware
-  fulfils every entry of the map in parallel; this client is a separate
-  implementation.
+- **A round carrying more than one input request never reaches a client on an
+  older protocol version.** A chain with two unknown hops makes the server
+  return two questions in one round — the repeat that keeps the earlier approval
+  alive ([ADR-0006](../../docs/adr/0006-per-hop-redirect-gating.md)). Claude
+  Code shows an empty result instead of prompting: no content, no error, no
+  questions.
+
+  First recorded here as a client limitation. That was wrong. The SDK's
+  server-side multi-round-trip bridge, which serves every client below protocol
+  2026-07-28, fulfils the first round by calling `elicitation/create` and then
+  reinvokes the handler **exactly once**. A second round is emitted on the wire
+  as `content: []` plus `inputRequests` that are never put to anyone.
+  Reproduced on 2026-08-22 against this server with a raw 2025-06-18 client and
+  a two-hop chain, so it is not specific to Claude Code. The server's response
+  is still well-formed, and a 2026-07-28 client would drive the retry loop
+  itself — but this server refuses that version while its handler is stateful,
+  which the SDK requires for it.
 - **Consequence: prefer `always` for chains that cross more than one unknown
   host.** An `always` is on disk by the retry, so the earlier hop is whitelisted
   rather than repeated and every round carries exactly one question. `once`

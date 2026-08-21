@@ -62,13 +62,24 @@ parallel, asking again costs a round trip, not a round trip per host.
   is repeated. With `once` a human is asked about the earlier hops again — for
   two unknown hops, three prompts over three round trips. Chains long enough to
   exceed the SDK's ten-retry cap fail closed.
-- Not every client renders a round carrying several questions. The response is
-  well-formed under SEP-2322 and the Go SDK's client middleware fulfils each
-  entry in parallel, but Claude Code returns an empty result rather than
-  prompting, which leaves a chain of two unknown hops unusable there with
-  `once`. `always` keeps every round to a single question and is the guidance
-  for such chains. Verified against a live client on 2026-08-22; see the PRD's
-  findings section.
+- A chain needing two rounds of approval cannot complete on a client older than
+  protocol 2026-07-28, whichever client it is. Such a client never sees an input
+  request: the SDK's server-side bridge turns the first one into a
+  server-initiated `elicitation/create`, and **reinvokes the handler exactly
+  once** with the answer. The second round's questions are returned on the wire
+  as they are, in a result whose content is an empty array, and an old client
+  that does not understand `inputRequests` shows nothing. `always` keeps every
+  round to a single question and is the guidance for such chains.
+
+  Observed first as "Claude Code returns an empty result rather than prompting"
+  and recorded here as a client limitation, which was wrong: reproduced on
+  2026-08-22 against this server with a raw client on 2025-06-18 and a two-hop
+  chain, which received one `elicitation/create`, answered it, and then got
+  `content: []` alongside two never-elicited `inputRequests`. The cause is the
+  single-shot bridge, so it affects every pre-2026-07-28 client equally. A
+  client on 2026-07-28 drives the retry loop itself and is unaffected — but this
+  server cannot serve that version while its HTTP handler is stateful, which the
+  SDK requires for it.
 - An `always` whose save fails is deliberately treated as exactly as durable as
   a `once`: allowed for this call, repeated in any later prompt. Anything else
   would let a chain stall on an approval that was never written down.
