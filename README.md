@@ -10,13 +10,12 @@ named, and puts everything else in front of you before it is fetched.
 
 ## Status
 
-Tickets 01 and 02 of four are implemented: whitelisted fetch over Streamable
-HTTP, plus a human approval prompt for unknown hosts.
+Tickets 01 through 03 of four are implemented: whitelisted fetch over Streamable
+HTTP, a human approval prompt for unknown hosts, and persistence of hosts
+approved with **always**.
 
-Approving a host with **always** currently behaves the same as **once** — it
-allows that call but is not written to the whitelist file, so it will be asked
-again. Persistence is ticket 03. See `.scratch/web-fetch-whitelist/` for the PRD
-and remaining tickets.
+Ticket 04 remains — a fetch that redirects to a non-whitelisted host still
+follows the redirect. See `.scratch/web-fetch-whitelist/` for the PRD.
 
 ## Install and run
 
@@ -69,6 +68,25 @@ and nothing else. `www.example.com` needs its own line.
 A missing file is treated as an empty whitelist rather than an error, so a first
 run needs no setup. That still refuses everything.
 
+Approving a host with **always** appends it here, sorted and canonical. The file
+is rewritten atomically — written alongside, flushed, and renamed into place — so
+a reader only ever sees the whole old file or the whole new one, never a
+partially written whitelist that the next start would refuse to parse. Existing
+file permissions are carried over; a whitelist created by a first approval is
+private. Only a human choosing *always* ever writes to it.
+
+The file is rewritten from the set loaded at startup plus whatever has been
+approved since, so edit it while the server is running and your edits will be
+overwritten by the next *always*. Stop the server to change it by hand.
+
+If the file cannot be written, the call the human just approved still succeeds —
+they did approve it — but the host is not remembered, the failure is logged, and
+the server keeps running:
+
+```
+2026/08/21 22:41:03 askweb: not persisting approval for "docs.example.org": saving whitelist /etc/askweb/hosts.json: ...
+```
+
 ## Connecting a client
 
 For Claude Code:
@@ -94,8 +112,8 @@ A host that is not on the whitelist does not fail outright — it asks you:
 > **once** · **always** · **deny**
 
 - **once** — fetches this one time, remembers nothing
-- **always** — fetches, and is meant to persist the host (ticket 03; today it
-  behaves as *once*)
+- **always** — fetches, and adds the host to the whitelist file, so it is never
+  asked again — including after a restart
 - **deny** — fetches nothing
 
 Everything that is not one of the first two is a denial: declining, cancelling,
@@ -138,6 +156,9 @@ exists to prevent, so matching is never anything but exact.
   influence whether a host is allowed would defeat the whitelist, so any change
   to the tool's schema has to preserve this. See ADR-0001 and ADR-0005.
 - **Fail closed.** Any path that is not an explicit allow is a denial.
+- **Only a human widens the whitelist.** `always` is the sole path that writes to
+  the file, and an approval that cannot be saved is not remembered at all —
+  never allowed in memory while missing from disk.
 - **Refusals disclose only the blocked host** — never the whitelist's contents.
 - **Redirects are a known gap.** A fetch that redirects to a non-whitelisted
   host currently follows it, bypassing the gate. Tracked as ticket 04. Until

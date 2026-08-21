@@ -1,14 +1,17 @@
 package server_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -65,12 +68,27 @@ func connect(t *testing.T, client *http.Client, entries ...string) *mcp.ClientSe
 // in-memory transports so no MCP traffic touches the network.
 func connectWith(t *testing.T, client *http.Client, answer elicitHandler, entries ...string) *mcp.ClientSession {
 	t.Helper()
-	ctx := context.Background()
+	store, _ := loadStore(t, entries...)
+	return connectTo(t, client, answer, store)
+}
 
-	store, err := whitelist.Load(writeWhitelist(t, entries...))
+// loadStore builds a store over a fresh whitelist file and returns both, for
+// tests that need to inspect what gets saved.
+func loadStore(t *testing.T, entries ...string) (*whitelist.Store, string) {
+	t.Helper()
+	path := writeWhitelist(t, entries...)
+	store, err := whitelist.Load(path)
 	if err != nil {
 		t.Fatalf("loading whitelist: %v", err)
 	}
+	return store, path
+}
+
+// connectTo is connectWith over a store the caller already built, for tests
+// that need to control or inspect the whitelist file.
+func connectTo(t *testing.T, client *http.Client, answer elicitHandler, store *whitelist.Store) *mcp.ClientSession {
+	t.Helper()
+	ctx := context.Background()
 
 	serverTransport, clientTransport := mcp.NewInMemoryTransports()
 	serverSession, err := server.New(store, client).Connect(ctx, serverTransport, nil)
@@ -618,5 +636,165 @@ func TestApprovalGrantedForTheRequestedHostFetches(t *testing.T) {
 	}
 	if !fetched {
 		t.Error("a matching approval performed no fetch")
+	}
+}
+
+// --- Ticket 03: persisting "always" approvals ---------------------------
+
+// savedHosts reads the whitelist file back off disk.
+func savedHosts(t *testing.T, path string) []string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		t.Fatalf("reading whitelist: %v", err)
+	}
+	var entries []string
+	if err := json.Unmarshal(data, &entries); err != nil {
+		t.Fatalf("parsing whitelist %s: %v", data, err)
+	}
+	return entries
+}
+
+// counting wraps an answer so a test can assert how often a human was asked.
+func counting(answer elicitHandler, prompts *int) elicitHandler {
+	return func(ctx context.Context, req *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+		*prompts++
+		return answer(ctx, req)
+	}
+}
+
+func TestAlwaysPersistsTheHostAndStopsPrompting(t *testing.T) {
+	client := newOrigin(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("persisted"))
+	})
+	store, path := loadStore(t, "example.com")
+
+	var prompts int
+	session := connectTo(t, client, counting(answer("always", nil), &prompts), store)
+
+	if res := callWebFetch(t, session, "https://unknown.example.com/page"); res.IsError {
+		t.Fatalf("first call failed: %s", resultText(t, res))
+	}
+	if prompts != 1 {
+		t.Fatalf("first call asked %d times, want 1", prompts)
+	}
+	if got := savedHosts(t, path); !slices.Contains(got, "unknown.example.com") {
+		t.Errorf("saved whitelist is %v, want it to contain the approved host", got)
+	}
+
+	// The whole point: the human is not asked twice.
+	if res := callWebFetch(t, session, "https://unknown.example.com/other"); res.IsError {
+		t.Fatalf("second call failed: %s", resultText(t, res))
+	}
+	if prompts != 1 {
+		t.Errorf("an approved-always host asked %d times, want to be asked only once", prompts)
+	}
+}
+
+// The restart: a new store reading the saved file must honour the approval.
+func TestAlwaysApprovalSurvivesRestart(t *testing.T) {
+	client := newOrigin(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("still approved"))
+	})
+	store, path := loadStore(t, "example.com")
+
+	session := connectTo(t, client, answer("always", nil), store)
+	if res := callWebFetch(t, session, "https://unknown.example.com/page"); res.IsError {
+		t.Fatalf("approving call failed: %s", resultText(t, res))
+	}
+
+	// Everything below is a fresh process: a new store, server, and session,
+	// sharing only the file on disk.
+	restarted, err := whitelist.Load(path)
+	if err != nil {
+		t.Fatalf("reloading whitelist: %v", err)
+	}
+	var prompts int
+	revived := connectTo(t, client, counting(answer("deny", nil), &prompts), restarted)
+
+	if res := callWebFetch(t, revived, "https://unknown.example.com/page"); res.IsError {
+		t.Fatalf("call after restart failed: %s", resultText(t, res))
+	}
+	if prompts != 0 {
+		t.Errorf("a host approved before the restart asked %d times after it, want 0", prompts)
+	}
+}
+
+// Only "always" writes. Every other outcome leaves the file exactly as it was.
+func TestOnlyAlwaysChangesTheSavedWhitelist(t *testing.T) {
+	tests := []struct {
+		name   string
+		answer elicitHandler
+	}{
+		{"once", answer("once", nil)},
+		{"deny", answer("deny", nil)},
+		{"declined", func(context.Context, *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+			return &mcp.ElicitResult{Action: "decline"}, nil
+		}},
+		{"cancelled", func(context.Context, *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+			return &mcp.ElicitResult{Action: "cancel"}, nil
+		}},
+		{"transport failure", func(context.Context, *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+			return nil, errors.New("elicitation transport blew up")
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := newOrigin(t, func(w http.ResponseWriter, r *http.Request) {})
+			store, path := loadStore(t, "example.com")
+			before := savedHosts(t, path)
+
+			session := connectTo(t, client, tt.answer, store)
+			tryWebFetch(session, "https://unknown.example.com/page")
+
+			if after := savedHosts(t, path); !slices.Equal(before, after) {
+				t.Errorf("saved whitelist changed from %v to %v", before, after)
+			}
+		})
+	}
+}
+
+// A save failure costs the persistence, not the call: the human did approve it.
+func TestApprovedCallSucceedsWhenTheWhitelistCannotBeSaved(t *testing.T) {
+	var logged bytes.Buffer
+	log.SetOutput(&logged)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	var fetched bool
+	client := newOrigin(t, func(w http.ResponseWriter, r *http.Request) {
+		fetched = true
+		w.Write([]byte("approved but unsaved"))
+	})
+
+	// A path under a directory that does not exist: readable as empty, unwritable.
+	path := filepath.Join(t.TempDir(), "no-such-dir", "whitelist.json")
+	store, err := whitelist.Load(path)
+	if err != nil {
+		t.Fatalf("loading whitelist: %v", err)
+	}
+
+	var prompts int
+	session := connectTo(t, client, counting(answer("always", nil), &prompts), store)
+
+	res := callWebFetch(t, session, "https://unknown.example.com/page")
+	if res.IsError {
+		t.Fatalf("approved call failed despite the human approving it: %s", resultText(t, res))
+	}
+	if !fetched {
+		t.Error("approved call performed no fetch")
+	}
+	if !strings.Contains(logged.String(), "unknown.example.com") {
+		t.Errorf("save failure was not logged; log holds %q", logged.String())
+	}
+
+	// Not persistently allowed: the next call must ask again.
+	if res := callWebFetch(t, session, "https://unknown.example.com/other"); res.IsError {
+		t.Fatalf("second call failed: %s", resultText(t, res))
+	}
+	if prompts != 2 {
+		t.Errorf("asked %d times, want 2 — an unsaved approval must not be remembered", prompts)
 	}
 }

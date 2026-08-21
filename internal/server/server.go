@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -55,7 +56,19 @@ func fetch(ctx context.Context, store *whitelist.Store, client *http.Client, req
 
 		switch {
 		case req.Params.InputResponses != nil:
-			if approval.Decide(req.Params.InputResponses, host) == approval.Deny {
+			switch approval.Decide(req.Params.InputResponses, host) {
+			case approval.Once:
+				// Allowed for this call only; nothing is recorded.
+			case approval.Always:
+				// A human chose to keep this host. If it cannot be saved, the
+				// call still proceeds — they did approve it — but the host is
+				// not remembered, so the next one asks again.
+				if err := store.Add(host); err != nil {
+					log.Printf("not persisting approval for %q: %v", host, err)
+				}
+			default:
+				// Deny, and anything a future Outcome might add. Only the two
+				// explicit approvals above reach the fetch (ADR-0001).
 				return nil, nil, denied
 			}
 		case !approval.ClientCanPrompt(req.Session):
