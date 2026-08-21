@@ -62,12 +62,19 @@ whitelist mounted in, speaks MCP over HTTP at `/mcp`, and asserts the packaging
 decisions that unit tests structurally cannot reach:
 
 1. the server answers on the published port,
-2. a whitelisted host is fetched — which proves CA certificates are present,
+2. a whitelisted host is fetched — which proves the certificate store is present,
 3. an *always* approval is written to the mounted whitelist and survives a
-   container restart — which proves the volume and file ownership are right.
+   container restart — which proves the volume and file ownership are right,
+4. all of the above still hold when the container is started with an overridden
+   uid and gid that exist nowhere in the image.
 
-That is one seam, not three, and it is a shell-level test against the image's
+That is one seam, not four, and it is a shell-level test against the image's
 external interface. It asserts nothing about how the image is layered.
+
+The fourth assertion is the one that earns its keep. An arbitrary-uid override
+is the case most likely to be broken by a plausible Dockerfile and least likely
+to be noticed, because the server still starts, still fetches, and still accepts
+approvals — it just cannot save them.
 
 Explicitly **not** proposed as seams: linting the Dockerfile, asserting image
 size, asserting layer count, or unit-testing the workflow YAML. These couple to
@@ -93,67 +100,99 @@ implementation and rot.
    approvals survive a restart, a recreate, and an image upgrade.
 9. As an operator, I want to edit the whitelist by hand on the host, so that I
    can seed it without going through an approval prompt.
-10. As an operator, I want the container to run as a non-root user, so that a
-    compromise of the fetch path is not a root process.
-11. As an operator, I want the non-root user to be able to write the whitelist,
-    so that *always* approvals are actually persisted rather than silently lost.
-12. As an operator, I want a clear startup failure when the whitelist is
+10. As an operator, I want the container to run as a non-root user by default,
+    so that a compromise of the fetch path is not a root process.
+11. As an operator, I want to override the container's uid and gid to arbitrary
+    values from my own compose file, so that it matches the service account my
+    host already uses.
+12. As an operator, I want approvals to persist under whatever uid and gid I
+    chose, so that overriding the user does not silently break *always*.
+13. As an operator, I want a shell in the image, so that I can debug outbound
+    connectivity from inside the container when a fetch fails.
+14. As an operator, I want a clear startup failure when the whitelist is
     unwritable, so that I find out at deploy time rather than when an approval
     quietly fails to save.
-13. As an operator, I want the listen address configurable through the
+15. As an operator, I want the listen address configurable through the
     environment, so that compose can set it without a custom command.
-14. As an operator, I want outbound HTTPS to work from inside the container, so
+16. As an operator, I want outbound HTTPS to work from inside the container, so
     that fetching a whitelisted host does not fail on certificate verification.
-15. As an operator, I want the image to contain no shell or package manager it
-    does not need, so that the attack surface stays small.
-16. As an operator, I want the image to carry provenance labels back to the
+17. As an operator, I want the image to carry no build toolchain, source, or
+    package cache, so that the attack surface stays small.
+18. As an operator, I want the image to carry provenance labels back to the
     commit it was built from, so that I can trace a running container to source.
-17. As a maintainer, I want the test suite run on every pull request, so that a
+19. As a maintainer, I want the test suite run on every pull request, so that a
     regression in the whitelist gate cannot merge.
-18. As a maintainer, I want the race detector enabled in CI, so that concurrent
+20. As a maintainer, I want the race detector enabled in CI, so that concurrent
     access to the whitelist store stays safe.
-19. As a maintainer, I want formatting and vet checked in CI, so that style
+21. As a maintainer, I want formatting and vet checked in CI, so that style
     review is not a human job.
-20. As a maintainer, I want the container smoke test in CI, so that a broken
+22. As a maintainer, I want the container smoke test in CI, so that a broken
     image is caught before it is published rather than by an operator.
-21. As a maintainer, I want third-party actions pinned by digest, so that the
+23. As a maintainer, I want third-party actions pinned by digest, so that the
     release pipeline is not a supply-chain hole in a security tool.
-22. As a maintainer, I want build cache between runs, so that CI stays fast.
-23. As a maintainer, I want the image built on pull requests without being
+24. As a maintainer, I want build cache between runs, so that CI stays fast.
+25. As a maintainer, I want the image built on pull requests without being
     pushed, so that a Dockerfile break is caught without publishing.
-24. As a Hermes operator, I want `askweb` reachable on a compose network by
+26. As a Hermes operator, I want `askweb` reachable on a compose network by
     service name, so that I can attach it to the Hermes stack.
-25. As a maintainer, I want the README to document the container path, so that
+27. As a maintainer, I want the README to document the container path, so that
     the compose file is not the only place the deployment is described.
 
 ## Implementation Decisions
 
 **Image.** Multi-stage build. A Go build stage compiles a static binary with
-CGO disabled; the final stage carries the binary, a CA bundle, and nothing else.
-The final stage should be `scratch` or a distroless static base — the decision
-hinges only on whether a shell is wanted for debugging, and the default is no
-shell.
+CGO disabled; the final stage is **Alpine**, carrying the binary, a CA bundle,
+and a non-root user.
 
-**A CA bundle must be copied in explicitly.** This is about *outbound* TLS, not
+Alpine over `scratch` or distroless deliberately. The image needs a root
+certificate store either way (see below), and on Alpine that is
+`apk add --no-cache ca-certificates` — explicit, self-documenting, and hard to
+get wrong — rather than a `COPY` of a path from the build stage that silently
+stops matching when the builder image changes. It also brings a shell, which is
+worth having when debugging a server whose whole job is reaching a network you
+cannot see from outside the container, and makes adding a non-root user a single
+instruction. The size difference over distroless is a few megabytes and buys
+real operability.
+
+**A root certificate store is required.** This is about *outbound* TLS, not
 inbound: `askweb` verifies the certificates of the whitelisted hosts it fetches,
-and Go reads the root store from disk — `/etc/ssl/certs/ca-certificates.crt` and
-a handful of distro alternatives. A `scratch` image has none of them, so every
-fetch fails with `x509: certificate signed by unknown authority` while the
+and Go reads the root store from disk — `/etc/ssl/certs/ca-certificates.crt`,
+`/etc/ssl/cert.pem`, and a handful of distro alternatives. An image without one
+fails every fetch with `x509: certificate signed by unknown authority` while the
 server itself looks perfectly healthy. Verified locally: the same binary against
-the same URL returns `200 OK` with the system pool and that error with an empty
-one. One `COPY` from the build stage fixes it; the smoke test exists largely to
-catch its absence.
+the same URL returns `200 OK` with a system pool and that error with an empty
+one. Alpine ships a bundle in its base, but the package should still be
+installed explicitly so the dependency is stated rather than inherited.
 
 **No inbound TLS.** The server speaks plain HTTP on `/mcp` and is reached either
 over a private compose network or through a reverse proxy that terminates TLS.
 The image holds no server certificate and no TLS configuration.
 
-**Non-root.** The image runs as a fixed non-root uid/gid, and that uid must be
-able to write the mounted data directory. A named volume is initialised by
-Docker with the image's ownership and just works; a bind-mount of a host
-directory owned by another uid does not, and produces a server that runs fine
-and silently forgets every approval. Compose should default to the case that
-works and document the `user:` override for operators who want a bind-mount.
+**Non-root, with an overridable uid and gid.** The image ships a default
+non-root user and never runs as root. An operator must be able to override it
+with any uid and gid — `user: "1003:1002"` in their own compose file, or
+`--user` on `docker run` — and have the server work, including persisting
+approvals. That is a hard requirement, not a documented nicety.
+
+It constrains the image: nothing may depend on the default user existing in
+`/etc/passwd`, on `$HOME`, or on a uid known at build time. The binary needs no
+identity, so the only real constraint is that the **data directory must be
+writable by whatever user the operator picks**. Two mechanisms are available and
+the ticket should choose deliberately:
+
+- give `/app/data` group ownership of gid `0` and mode `0775`, the convention
+  arbitrary-uid platforms use, so any uid running with a supplementary root
+  group can write it; or
+- document that a bind-mounted host directory must be `chown`ed to the chosen
+  uid, and default compose to a named volume where first-run ownership is
+  handled for the operator.
+
+Whichever is chosen, the failure it guards against is the same and is silent:
+a data directory the running user cannot write produces a server that starts,
+fetches, prompts, accepts *always* — and forgets it.
+
+The container must not `chown` at startup from an entrypoint, since that would
+require starting as root and defeats the requirement.
 
 **Whitelist location.** The image defaults `ASKWEB_WHITELIST` to an absolute
 path under a dedicated data directory — `/app/data/whitelist.json` — rather than
@@ -223,9 +262,10 @@ in CI with `-race`, exactly as it runs locally. No Go test gains a Docker
 dependency; the suite must keep passing on a machine with no Docker installed.
 
 **The container smoke test** is a shell-level test in CI, at the seam described
-above. Its three assertions map to the three ways packaging can break while the
-unit tests stay green: wrong port or bind address, missing CA certificates, and
-an unwritable or non-persistent whitelist mount. The restart assertion is the
+above. Its assertions map to the ways packaging can break while the unit tests
+stay green: wrong port or bind address, a missing certificate store, an
+unwritable or non-persistent whitelist mount, and a data directory that only the
+image's default user can write. The restart assertion is the
 important one — it is the only place the volume and uid decisions are actually
 verified, and it is the failure that would otherwise reach an operator as
 "approvals keep disappearing".
