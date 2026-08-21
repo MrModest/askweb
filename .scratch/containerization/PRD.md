@@ -240,9 +240,15 @@ into place, so it needs write permission on the containing directory, not just
 on the file. Mounting a single file also means a first run with no whitelist has
 nowhere to create one.
 
-**Fail loudly on an unwritable whitelist.** This is now load-bearing rather than
-a nicety, because the ownership contract above puts the mount in the operator's
-hands. Today an unsaveable approval is
+**Create the whitelist on first run; fail loudly only when the directory is
+unwritable.** A writable data directory with no whitelist file in it is the
+normal first-run case: the server creates an empty `[]` file rather than
+treating it as a problem, which also gives an operator immediate confirmation
+that the mount is wired up. An unwritable directory — or an existing whitelist
+that cannot be written — is a startup error naming the path.
+
+This is load-bearing rather than a nicety, because the ownership contract above
+puts the mount in the operator's hands. Today an unsaveable approval is
 logged and dropped, which is correct at runtime but invisible at deploy time.
 A startup writability check is proposed so a misconfigured mount fails fast.
 This changes server behaviour and touches the whitelist module, so it should be
@@ -273,11 +279,15 @@ architecture. No emulation, no per-arch suffixed tags, one workflow. If a future
 dependency introduces cgo this needs revisiting, since cross-compiling would
 then need a C toolchain per target.
 
-**Workflow layout.** Two workflows, matching the reference repo's separation of
-concerns: a `ci` workflow running formatting, vet, and tests on pushes and pull
-requests to `main`; and a build-and-push workflow triggered on merges to `main`
-and on version tags. The build workflow builds without pushing on pull requests
-so a broken Dockerfile is caught early. Third-party actions are pinned by commit
+**Workflow layout — one GitHub Actions workflow, gated by `needs:`.** Formatting,
+vet, and tests run first; the image is only built once they pass; and it is only
+pushed once the container smoke test passes. Expressing that as job dependencies
+inside a single workflow keeps the gate direct and legible. The reference repo
+splits `ci.yml` from its `docker-*.yml` workflows because it builds several apps
+on different triggers and paths; with one image and one gate, that split would
+mean reaching for `workflow_run` to express an ordering that `needs:` states
+plainly. Pull requests run the whole pipeline except the push, so a broken
+Dockerfile is caught without publishing. Third-party actions are pinned by commit
 digest, as the reference does — this is a security tool and its pipeline should
 not be its weakest link. Build cache uses the GitHub Actions cache backend.
 
