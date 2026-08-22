@@ -3,6 +3,7 @@ package approval
 import (
 	"testing"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -58,15 +59,6 @@ func TestDecideDeniesEverythingElse(t *testing.T) {
 				Content: map[string]any{field: choiceAlways},
 			},
 		}},
-		{"accepted with no content", mcp.InputResponseMap{
-			requestID(host): &mcp.ElicitResult{Action: "accept"},
-		}},
-		{"accepted with wrong field", mcp.InputResponseMap{
-			requestID(host): &mcp.ElicitResult{
-				Action:  "accept",
-				Content: map[string]any{"approve": choiceAlways},
-			},
-		}},
 		{"choice of the wrong type", mcp.InputResponseMap{
 			requestID(host): &mcp.ElicitResult{
 				Action:  "accept",
@@ -83,6 +75,60 @@ func TestDecideDeniesEverythingElse(t *testing.T) {
 				t.Errorf("Decide = %v, want Deny", got)
 			}
 		})
+	}
+}
+
+// A client that can only carry the action back still gets its human's approval
+// honoured — as a "once", the least the accept could have meant. Nothing here
+// may ever come back Always: a whitelist entry needs the word (ADR-0008).
+func TestDecideReadsAnAcceptWithoutAChoiceAsOnce(t *testing.T) {
+	tests := []struct {
+		name      string
+		responses mcp.InputResponseMap
+	}{
+		{"no content at all", mcp.InputResponseMap{
+			requestID(host): &mcp.ElicitResult{Action: "accept"},
+		}},
+		{"empty content", mcp.InputResponseMap{
+			requestID(host): &mcp.ElicitResult{
+				Action:  "accept",
+				Content: map[string]any{},
+			},
+		}},
+		{"content without the choice", mcp.InputResponseMap{
+			requestID(host): &mcp.ElicitResult{
+				Action:  "accept",
+				Content: map[string]any{"approve": choiceAlways},
+			},
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := Decide(tt.responses, host); got != Once {
+				t.Errorf("Decide = %v, want Once", got)
+			}
+		})
+	}
+}
+
+// The prompt asks for the choice but must not require it, or the SDK rejects a
+// consent-only client's answer against this very schema and the call dies
+// before Decide can read the human's accept (ADR-0008).
+func TestRequestDoesNotRequireTheChoice(t *testing.T) {
+	built := Request(host)[requestID(host)]
+	request, ok := built.(*mcp.ElicitParams)
+	if !ok {
+		t.Fatalf("Request built a %T, want an elicitation prompt", built)
+	}
+	schema, ok := request.RequestedSchema.(*jsonschema.Schema)
+	if !ok {
+		t.Fatalf("prompt carries a %T schema, want a *jsonschema.Schema", request.RequestedSchema)
+	}
+	if len(schema.Required) != 0 {
+		t.Errorf("requested schema requires %v, want nothing required", schema.Required)
+	}
+	if _, ok := schema.Properties[field]; !ok {
+		t.Errorf("requested schema does not offer the %q choice at all", field)
 	}
 }
 

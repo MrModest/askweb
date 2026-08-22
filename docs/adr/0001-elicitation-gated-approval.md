@@ -1,6 +1,6 @@
 # ADR-0001: Elicitation-gated approval for non-whitelisted hosts
 
-**Status:** Accepted (mechanism superseded by [ADR-0005](./0005-multi-round-trip-input-requests.md))
+**Status:** Accepted (mechanism superseded by [ADR-0005](./0005-multi-round-trip-input-requests.md); the reading of a malformed answer narrowed by [ADR-0008](./0008-accept-is-the-approval.md))
 **Date:** 2026-08-01
 
 ## Context
@@ -37,7 +37,9 @@ model-controlled input reaches the decision. Therefore:
 
 Every path that is not an explicit approval is a denial — `decline`, `cancel`,
 timeout, transport error, malformed response, unrecognized enum value. Fail
-closed.
+closed. ([ADR-0008](./0008-accept-is-the-approval.md) later narrows one case: an
+`accept` that carries no choice at all is an approval of that single call, since
+the action is itself the human's answer.)
 
 Elicitation is an optional client capability. If the connected client does not
 declare it, unknown hosts are denied rather than silently fetched.

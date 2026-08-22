@@ -432,12 +432,6 @@ func TestNonApprovalOutcomesFetchNothing(t *testing.T) {
 		}},
 		{"unrecognized choice", answer("yes-please", nil)},
 		{"empty choice", answer("", nil)},
-		{"accepted with no content", func(context.Context, *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
-			return &mcp.ElicitResult{Action: "accept"}, nil
-		}},
-		{"accepted with wrong field", func(context.Context, *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
-			return &mcp.ElicitResult{Action: "accept", Content: map[string]any{"approve": "once"}}, nil
-		}},
 		{"unrecognized action", func(context.Context, *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
 			return &mcp.ElicitResult{Action: "shrug", Content: map[string]any{"decision": "once"}}, nil
 		}},
@@ -458,6 +452,70 @@ func TestNonApprovalOutcomesFetchNothing(t *testing.T) {
 				t.Error("refused call performed a fetch, want none")
 			}
 		})
+	}
+}
+
+// A client that answers with the action alone — no choice filled in, which is
+// how a client that renders the prompt as a plain approve/refuse button
+// answers — still gets its human's approval honoured, as a "once" (ADR-0008).
+func TestConsentOnlyApprovalFetchesWithoutPersisting(t *testing.T) {
+	var fetched bool
+	client := newOrigin(t, func(w http.ResponseWriter, r *http.Request) {
+		fetched = true
+		w.Write([]byte("approved by action alone"))
+	})
+	store, path := loadStore(t, "example.com")
+	before := savedHosts(t, path)
+
+	var prompts int
+	session := connectTo(t, client, counting(consentOnly, &prompts), store)
+
+	res := callWebFetch(t, session, "https://unknown.example.com/page")
+	if res.IsError {
+		t.Fatalf("call failed: %s", resultText(t, res))
+	}
+	if !fetched {
+		t.Error("approved call performed no fetch")
+	}
+	if got := resultText(t, res); got != "approved by action alone" {
+		t.Errorf("body = %q, want %q", got, "approved by action alone")
+	}
+
+	// A choice nobody made cannot be an "always": the whitelist is untouched,
+	// and the next call asks again.
+	if after := savedHosts(t, path); !slices.Equal(before, after) {
+		t.Errorf("saved whitelist changed from %v to %v", before, after)
+	}
+	if res := callWebFetch(t, session, "https://unknown.example.com/other"); res.IsError {
+		t.Fatalf("second call failed: %s", resultText(t, res))
+	}
+	if prompts != 2 {
+		t.Errorf("two calls asked %d times, want to be asked each time", prompts)
+	}
+}
+
+// consentOnly accepts the prompt the way a client that cannot fill in a form
+// does: the action, and an empty content object.
+func consentOnly(context.Context, *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+	return &mcp.ElicitResult{Action: "accept", Content: map[string]any{}}, nil
+}
+
+// The same client refusing is still a refusal — the action carries that too.
+func TestConsentOnlyRefusalFetchesNothing(t *testing.T) {
+	var fetched bool
+	client := newOrigin(t, func(w http.ResponseWriter, r *http.Request) {
+		fetched = true
+	})
+	session := connectWith(t, client, func(context.Context, *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+		return &mcp.ElicitResult{Action: "decline", Content: map[string]any{}}, nil
+	}, "example.com")
+
+	res, err := tryWebFetch(session, "https://unknown.example.com/page")
+	if !refused(res, err) {
+		t.Error("call succeeded, want a refusal")
+	}
+	if fetched {
+		t.Error("refused call performed a fetch, want none")
 	}
 }
 

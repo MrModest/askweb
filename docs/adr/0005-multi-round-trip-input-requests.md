@@ -60,7 +60,11 @@ caller could assert its own approval. Only the transport of the question changes
 - The SDK validates the human's answer against the requested schema before the
   handler sees it, so an answer outside the three choices surfaces as a protocol
   error rather than a tool error. Both refuse and neither fetches, so tests
-  accept either shape.
+  accept either shape. This cuts both ways, and
+  [ADR-0008](./0008-accept-is-the-approval.md) is the bill: a schema that
+  requires the choice makes the SDK reject a consent-only client's accept
+  outright, failing a call a human approved. What the schema demands is a
+  compatibility decision, not only a validation one.
 - A client that declares no elicitation capability is checked explicitly and
   denied before any prompt is built, rather than discovering the problem when
   the round trip fails.

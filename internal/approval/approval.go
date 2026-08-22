@@ -10,6 +10,11 @@
 // The model requesting the fetch cannot see, supply, or influence the answer:
 // the prompt is answered by the client's human, and web_fetch exposes no
 // parameter through which a caller could assert its own approval (ADR-0001).
+//
+// Clients differ in how much of an answer they can carry back. Some render the
+// three choices; others put the prompt to a human as a plain approve/refuse and
+// return the action alone. Both are honoured: accepting allows the call, and
+// only the explicit word "always" also widens the whitelist (ADR-0008).
 package approval
 
 import (
@@ -23,9 +28,9 @@ import (
 type Outcome int
 
 const (
-	// Deny is the zero value on purpose: every path that is not an explicit
-	// approval — a decline, a cancel, a timeout, a transport failure, an answer
-	// matching no choice — must land here.
+	// Deny is the zero value on purpose: every path that is not an approval — a
+	// decline, a cancel, a timeout, a transport failure, a stated choice matching
+	// none of the ones offered — must land here.
 	Deny Outcome = iota
 	// Once allows this call and nothing beyond it.
 	Once
@@ -53,6 +58,13 @@ const (
 // Request builds the prompt asking whether hosts may be fetched. Returning it
 // from a tool handler suspends the call until a human answers.
 //
+// The choice is offered as an enum, but it is not required. Some clients put a
+// prompt to a human as a plain approve/refuse button and answer with the action
+// alone, filling in no field at all (ADR-0008). Marking the field required
+// makes the SDK reject those answers against this schema, which fails the whole
+// call before any of this package's fail-closed reading of it ever runs — so
+// the question a human was actually asked would go unanswered on a technicality.
+//
 // Asking about several hosts at once is how a chain of redirects keeps the
 // approvals it has already been given. A client answers the questions in the
 // map it was last handed and sends those answers back together, replacing what
@@ -72,7 +84,6 @@ func Request(hosts ...string) mcp.InputRequestMap {
 						Enum:        []any{choiceOnce, choiceAlways, choiceDeny},
 					},
 				},
-				Required: []string{field},
 			},
 		}
 	}
@@ -82,15 +93,27 @@ func Request(hosts ...string) mcp.InputRequestMap {
 // Decide reads the human's answer about host out of a retried call's input
 // responses.
 //
-// Anything other than an explicit approval of this host is a Deny, so a
-// missing, malformed, unrecognized, or differently-addressed answer can never
-// be mistaken for permission.
+// Accepting is the approval. The action is what a human acted on — the question
+// named this host and asked whether it may be fetched — and the choice only says
+// how long that answer lasts. So an accept carrying no choice is read as the
+// least it could mean: this call and nothing more, with the whitelist left
+// alone. Only the word "always" widens the whitelist, and a client that cannot
+// collect a choice therefore cannot widen it either (ADR-0008).
+//
+// Everything else is a Deny: a decline, a cancel, an answer to a question about
+// another host, a response that is not an elicitation result at all, and a
+// choice that was made but matches none of the ones offered. A stated answer is
+// taken at its word or not at all — only an absent one falls back.
 func Decide(responses mcp.InputResponseMap, host string) Outcome {
 	result, ok := responses[requestID(host)].(*mcp.ElicitResult)
 	if !ok || result.Action != "accept" {
 		return Deny
 	}
-	switch result.Content[field] {
+	choice, chose := result.Content[field]
+	if !chose {
+		return Once
+	}
+	switch choice {
 	case choiceOnce:
 		return Once
 	case choiceAlways:

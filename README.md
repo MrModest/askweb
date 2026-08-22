@@ -217,8 +217,26 @@ A host that is not on the whitelist does not fail outright — it asks you:
 - **deny** — fetches nothing
 
 Everything that is not one of the first two is a denial: declining, cancelling,
-letting the prompt expire, a transport failure, or an answer matching none of
-the choices. Nothing is retried.
+letting the prompt expire, a transport failure, or picking something that is
+none of the choices. Nothing is retried.
+
+### Clients that only ask yes or no
+
+Some clients don't render the three choices. They put the prompt to you as a
+plain approve/refuse — buttons on a chat platform, say — and answer with that
+action alone, filling in no choice at all. Hermes is one of these.
+
+Approving on such a client fetches the page. It counts as **once**: the whitelist
+is not written, and the next call asks you again. Refusing fetches nothing, as
+always.
+
+The reason is that accepting is itself the answer — you were asked whether this
+host may be fetched, and you said yes — while the choice only decides how long
+that yes lasts. With no choice to read, askweb takes the smallest thing your
+approval could have meant. **Growing the whitelist from one of these clients
+means editing `whitelist.json` by hand** (stop the server first, as above); a
+persistent grant needs a human who was actually offered one. See
+[ADR-0008](docs/adr/0008-accept-is-the-approval.md).
 
 Your client has to be able to show the prompt. If it never declared that
 capability, an unknown host is refused rather than fetched — the question could
@@ -287,7 +305,8 @@ exists to prevent, so matching is never anything but exact.
   written by your client, never in the tool's arguments. A parameter that could
   influence whether a host is allowed would defeat the whitelist, so any change
   to the tool's schema has to preserve this. See ADR-0001 and ADR-0005.
-- **Fail closed.** Any path that is not an explicit allow is a denial.
+- **Fail closed.** Any path that is not an approval is a denial — and only your
+  client's `accept` is an approval.
 - **Only a human widens the whitelist.** `always` is the sole path that writes to
   the file, and an approval that cannot be saved is not remembered at all —
   never allowed in memory while missing from disk.
@@ -314,6 +333,8 @@ Recorded as ADRs in [`docs/adr/`](docs/adr/):
   checked against the whitelist
 - [ADR-0007](docs/adr/0007-create-the-whitelist-at-startup.md) — the whitelist is
   created at startup, and a server that cannot write it refuses to start
+- [ADR-0008](docs/adr/0008-accept-is-the-approval.md) — accepting the prompt is
+  the approval; the choice only says how long it lasts
 
 ## Development
 
