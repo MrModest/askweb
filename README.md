@@ -8,69 +8,45 @@ It exists because general-purpose web tools give an agent unrestricted outbound
 access, which is a prompt-injection surface. `askweb` narrows that to hosts you
 named, and puts everything else in front of you before it is fetched.
 
-## Status
-
-The server is complete: whitelisted fetch over Streamable HTTP, a human
-approval prompt for unknown hosts, persistence of hosts approved with
-**always**, and re-validation of every redirect hop. It ships as a container
-image built and smoke-tested on every merge.
-
-See `.scratch/web-fetch-whitelist/` and `.scratch/containerization/` for the
-PRDs.
-
-## Install and run
-
-Requires Go 1.26 or newer.
+## Quick start
 
 ```sh
-go build ./cmd/askweb
-./askweb
+mkdir -p ./data && sudo chown 10001:10001 ./data
+docker run -d --name askweb -p 8080:8080 -v "$PWD/data:/app/data" \
+  ghcr.io/mrmodest/askweb:0.1.0
 ```
 
 The server listens on `:8080` and serves MCP over Streamable HTTP at `/mcp`.
 
-## Running in Docker
-
-An image is published for every merge to `main`, for `linux/amd64` and
-`linux/arm64` under one tag — pull it and your client picks the right one.
-
-```sh
-docker pull ghcr.io/mrmodest/askweb:edge
-```
-
-| Tag | Moves? | Use it for |
-|---|---|---|
-| `edge` | yes, every merge to `main` | trying it out, or a stack you redeploy deliberately |
-| `sha-<short>` | never | pinning a deployment to an exact commit |
-| `1.2.3`, `1.2` | on releases | pinning to a release once one is tagged |
-
-Pin `sha-` or a semver tag for anything you care about. `edge` moving under you
-is the point of `edge`.
-
-The compose file in this repository runs it:
+Or with the compose file from this repository, which is the better starting
+point for anything long-lived:
 
 ```sh
 mkdir -p ./data && sudo chown 10001:10001 ./data
 docker compose up -d
 ```
 
-That publishes `8080` and mounts `./data`. Override any of it from the
-environment without touching the image: `ASKWEB_HOST_PORT`,
-`ASKWEB_CONTAINER_PORT`, `ASKWEB_ADDR`, `ASKWEB_WHITELIST`, `ASKWEB_DATA_DIR`.
+The image is published for `linux/amd64` and `linux/arm64` under one tag, so
+your host pulls the right one on its own.
+
+| Tag | Moves? | Use it for |
+|---|---|---|
+| `0.1.0`, `0.1` | no | pinning to a release |
+| `sha-<short>` | never | pinning to an exact commit |
+| `edge` | yes, every merge to `main` | trying it out, or a stack you redeploy deliberately |
 
 **The container speaks plain HTTP and holds no certificate.** Reach it by
 service name on a private compose network, or put a reverse proxy that
 terminates TLS in front of it. It does verify the certificates of the hosts it
-fetches — that is a separate concern, and the image carries the root store for
-it.
+fetches — a separate concern, and the image carries the root store for it.
 
-### The data directory
+## The data directory
 
 The whitelist lives at `/app/data/whitelist.json`, and it is the **directory**
 that is mounted, never the file. Approvals are saved by writing a temporary file
 alongside the target and renaming it into place, so the directory has to be
-writable — and on a first run there has to be somewhere to create the file at
-all. Bind-mounting `whitelist.json` itself gives you a server that cannot save a
+writable — and a first run has to be able to create the file at all.
+Bind-mounting `whitelist.json` itself gives you a server that cannot save a
 single approval.
 
 ### Running as your own user
@@ -92,48 +68,32 @@ point is not having it. Give the directory to whichever user you chose:
 mkdir -p ./data && sudo chown 1003:1002 ./data
 ```
 
-Get it wrong and the server tells you at startup rather than discovering it
-weeks later as "approvals keep disappearing":
+Get it wrong and the server says so at startup, rather than letting you discover
+it weeks later as "approvals keep disappearing":
 
 ```
-2026/08/21 23:01:51 askweb: creating whitelist /app/data/whitelist.json: open /app/data/whitelist.json.2539359718.tmp: permission denied
+askweb: creating whitelist /app/data/whitelist.json: open /app/data/whitelist.json.2539359718.tmp: permission denied
 ```
 
 An existing whitelist it cannot replace fails the same way, naming the path. If
 Docker creates the bind-mount directory for you it will belong to root, and this
 is the error you will get.
 
-### Editing the whitelist by hand
-
-The same rule as the binary, and it bites more easily here: the file is
-rewritten from what was loaded at startup plus everything approved since, so
-edits made while the stack is running are lost at the next *always*. Stop it
-first:
-
-```sh
-docker compose stop askweb
-sudo $EDITOR ./data/whitelist.json
-docker compose start askweb
-```
-
-The file belongs to whichever user the container runs as, not to you, which is
-why that needs `sudo` — and why the server can write it and you cannot.
-
-Restarting drops MCP sessions, so connected clients reconnect afterwards.
-
 ## Configuration
 
 Each setting takes a flag, falling back to an environment variable, falling back
-to a default. Nothing is baked into the binary.
+to a default. Nothing is baked into the image.
 
 | Flag | Environment | Default | Meaning |
 |---|---|---|---|
 | `--addr` | `ASKWEB_ADDR` | `:8080` | Listen address for the MCP HTTP server |
 | `--whitelist` | `ASKWEB_WHITELIST` | `whitelist.json` | Path to the allowed-hostnames file |
 
-```sh
-./askweb --addr 127.0.0.1:9000 --whitelist /etc/askweb/hosts.json
-```
+The image sets `ASKWEB_WHITELIST=/app/data/whitelist.json`. The compose file also
+reads `ASKWEB_HOST_PORT`, `ASKWEB_CONTAINER_PORT`, and `ASKWEB_DATA_DIR`, so the
+published port and the mount can change without touching the image.
+
+Nothing binds below port 1024: a non-root user cannot.
 
 ## The whitelist file
 
@@ -152,7 +112,7 @@ normalization, so `Example.COM` would otherwise sit in the file granting nothing
 at all, silently.
 
 ```
-2026/08/01 13:06:38 askweb: whitelist hosts.json: entry "Example.COM" is not canonical, write it as "example.com"
+askweb: whitelist hosts.json: entry "Example.COM" is not canonical, write it as "example.com"
 ```
 
 **Subdomains are not implied.** An entry for `example.com` grants `example.com`
@@ -176,32 +136,106 @@ file permissions are carried over; a whitelist created by a first approval is
 private. Only a human choosing *always* ever writes to it.
 
 The file is rewritten from the set loaded at startup plus whatever has been
-approved since, so edit it while the server is running and your edits will be
-overwritten by the next *always*. Stop the server to change it by hand.
+approved since, so edits made while the server runs are overwritten by the next
+*always*. Stop it first:
 
-If the file cannot be written, the call the human just approved still succeeds —
-they did approve it — but the host is not remembered, the failure is logged, and
-the server keeps running:
+```sh
+docker compose stop askweb
+sudo $EDITOR ./data/whitelist.json
+docker compose start askweb
+```
+
+The file belongs to whichever user the container runs as, not to you, which is
+why that needs `sudo` — and why the server can write it and you cannot.
+
+If the file cannot be written while the server is running, the call the human
+just approved still succeeds — they did approve it — but the host is not
+remembered, the failure is logged, and the server keeps running:
 
 ```
-2026/08/21 22:41:03 askweb: not persisting approval for "docs.example.org": saving whitelist /etc/askweb/hosts.json: ...
+askweb: not persisting approval for "docs.example.org": saving whitelist /app/data/whitelist.json: ...
 ```
 
 ## Connecting a client
-
-For Claude Code:
-
-```sh
-claude mcp add --transport http askweb http://localhost:8080/mcp
-```
-
-Restarting the binary drops the MCP session, so reconnect afterwards.
 
 The server advertises one tool:
 
 **`web_fetch`** — takes a single `url` argument and returns the response body.
 A whitelisted host is fetched straight away. Any other host prompts you first;
 without your approval it returns an error naming only the blocked host.
+
+Restarting the server drops MCP sessions, so clients reconnect afterwards.
+
+### Claude Code
+
+```sh
+claude mcp add --transport http askweb http://localhost:8080/mcp
+```
+
+Or as JSON, in `.mcp.json` at the root of a project — checked in, so whoever
+clones it gets the same server — or in `~/.claude.json` for every project:
+
+```json
+{
+  "mcpServers": {
+    "askweb": {
+      "type": "http",
+      "url": "http://localhost:8080/mcp"
+    }
+  }
+}
+```
+
+### Hermes
+
+In `~/.hermes/config.yaml`, or `cli-config.yaml` beside the project:
+
+```yaml
+mcp_servers:
+  askweb:
+    url: "http://localhost:8080/mcp"
+```
+
+When Hermes runs in the same compose project, reach `askweb` by service name on
+the shared network and publish no port at all:
+
+```yaml
+mcp_servers:
+  askweb:
+    url: "http://askweb:8080/mcp"
+```
+
+That is the arrangement this server is built for: no published port, no TLS, and
+nothing outside the compose network able to reach it.
+
+### Other clients
+
+Any MCP client that speaks Streamable HTTP can connect to `/mcp`. Two things
+decide whether it is usable.
+
+**It must be able to put a question to you.** A client that never declares the
+elicitation capability cannot be asked anything, so every unknown host is
+refused rather than fetched. Such a client still works against hosts already in
+the whitelist file, which you can seed by hand.
+
+**A stdio-only client needs a bridge.** Clients that only spawn subprocesses —
+`pi` among them, whose MCP support comes from an extension and whose config
+takes `command`/`args` rather than a URL — reach an HTTP server through a
+stdio-to-HTTP proxy:
+
+```json
+{
+  "mcpServers": {
+    "askweb": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "http://localhost:8080/mcp"]
+    }
+  }
+}
+```
+
+That shape is untested here, and a bridge only forwards what both ends support:
+if the client cannot show an elicitation prompt, unknown hosts stay refused.
 
 ## Approving an unknown host
 
@@ -219,10 +253,6 @@ A host that is not on the whitelist does not fail outright — it asks you:
 Everything that is not one of the first two is a denial: declining, cancelling,
 letting the prompt expire, a transport failure, or an answer matching none of
 the choices. Nothing is retried.
-
-Your client has to be able to show the prompt. If it never declared that
-capability, an unknown host is refused rather than fetched — the question could
-not be put, so nobody approved it.
 
 The prompt is carried as a multi-round-trip input request (SEP-2322): the tool
 returns a request for input, your client asks you, and the call is retried with
@@ -293,9 +323,11 @@ exists to prevent, so matching is never anything but exact.
   never allowed in memory while missing from disk.
 - **Refusals disclose only the blocked host** — never the whitelist's contents.
 - **Redirects are checked hop by hop.** A whitelisted host that redirects
-  elsewhere does not smuggle that host past the gate — see below.
-- **No response size limit or content-type filtering** yet — out of scope for
-  now.
+  elsewhere does not smuggle that host past the gate.
+- **The container never runs as root** and holds no server certificate: it is
+  meant to sit on a private network or behind a reverse proxy.
+- **No response size limit and no content-type filtering.** A whitelisted host
+  can return anything, of any size.
 
 ## Design decisions
 
@@ -317,7 +349,11 @@ Recorded as ADRs in [`docs/adr/`](docs/adr/):
 
 ## Development
 
+Requires Go 1.26 or newer.
+
 ```sh
+go build ./cmd/askweb
+./askweb --addr 127.0.0.1:9000 --whitelist ./whitelist.json
 go test ./...
 ```
 
@@ -346,7 +382,5 @@ Layout:
 | `internal/server` | The MCP server and the `web_fetch` handler |
 | `cmd/askweb` | Entry point |
 
-No test touches the real network. MCP round trips use the SDK's in-memory
-transports, and outbound fetches go through a client whose dialer redirects
-every connection to a local TLS server — which is why the tests can use
-realistic `https://example.com` URLs while staying entirely in-process.
+MCP round trips in the tests use the SDK's in-memory transport, and outbound
+fetches go to local test servers.
